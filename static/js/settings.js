@@ -5821,6 +5821,119 @@ export function close() {
   _tryOpen();
 })();
 
+// ── Microsoft Account connect / disconnect UI ──────────────────────────────
+
+async function _msGraphRefreshStatus() {
+  const badge = document.getElementById('msgraph-status-badge');
+  const userEl = document.getElementById('msgraph-status-user');
+  const connectBtn = document.getElementById('msgraph-connect-btn');
+  const disconnectBtn = document.getElementById('msgraph-disconnect-btn');
+  if (!badge) return;
+  try {
+    const res = await fetch('/api/msgraph/status', { credentials: 'same-origin' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (data.connected) {
+      badge.textContent = '✅ Connected';
+      badge.style.background = 'color-mix(in srgb, #50fa7b 18%, transparent)';
+      badge.style.color = 'var(--fg)';
+      badge.style.opacity = '1';
+      userEl.textContent = data.display_name
+        ? `${data.display_name}${data.upn ? ' · ' + data.upn : ''}`
+        : '';
+      if (connectBtn) connectBtn.style.display = 'none';
+      if (disconnectBtn) disconnectBtn.style.display = '';
+    } else {
+      badge.textContent = '⚪ Not connected';
+      badge.style.background = '';
+      badge.style.color = '';
+      badge.style.opacity = '0.6';
+      userEl.textContent = '';
+      if (connectBtn) connectBtn.style.display = '';
+      if (disconnectBtn) disconnectBtn.style.display = 'none';
+    }
+  } catch (e) {
+    badge.textContent = '⚠️ Status unavailable';
+    badge.style.opacity = '0.5';
+  }
+}
+
+(function _initMsGraphUI() {
+  // Wire up as soon as the DOM is ready — the card is static HTML so no
+  // need to wait for the settings modal to fully initialise.
+  function _wire() {
+    const connectBtn = document.getElementById('msgraph-connect-btn');
+    const disconnectBtn = document.getElementById('msgraph-disconnect-btn');
+    const msgEl = document.getElementById('msgraph-msg');
+    if (!connectBtn || connectBtn.dataset.wired) return;
+    connectBtn.dataset.wired = '1';
+
+    _msGraphRefreshStatus();
+
+    connectBtn.addEventListener('click', async () => {
+      if (msgEl) { msgEl.textContent = 'Starting OAuth…'; msgEl.style.color = ''; }
+      connectBtn.disabled = true;
+      try {
+        const res = await fetch('/api/msgraph/connect/start', {
+          method: 'POST',
+          credentials: 'same-origin',
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+        // Open the Microsoft sign-in page in a new tab
+        window.open(data.auth_url, '_blank', 'noopener,noreferrer');
+        if (msgEl) {
+          msgEl.textContent = 'Sign in the new tab. This status will refresh automatically once you return.';
+          msgEl.style.color = '';
+        }
+        // Poll status every 3s for 3 minutes in case the popup completes
+        let polls = 0;
+        const pollInterval = setInterval(async () => {
+          polls++;
+          await _msGraphRefreshStatus();
+          const badge = document.getElementById('msgraph-status-badge');
+          if ((badge && badge.textContent.includes('Connected')) || polls > 60) {
+            clearInterval(pollInterval);
+            if (msgEl && badge && badge.textContent.includes('Connected')) {
+              msgEl.textContent = '✅ Microsoft account connected.';
+              msgEl.style.color = 'var(--accent, #50fa7b)';
+            }
+          }
+        }, 3000);
+      } catch (e) {
+        if (msgEl) { msgEl.textContent = `Error: ${e.message}`; msgEl.style.color = 'var(--color-error, #e53e3e)'; }
+      } finally {
+        connectBtn.disabled = false;
+      }
+    });
+
+    disconnectBtn.addEventListener('click', async () => {
+      if (!confirm('Disconnect Microsoft account? The agent will lose access to Outlook and Teams.')) return;
+      try {
+        await fetch('/api/msgraph/disconnect', { method: 'POST', credentials: 'same-origin' });
+        if (msgEl) { msgEl.textContent = 'Disconnected.'; msgEl.style.color = ''; }
+        _msGraphRefreshStatus();
+      } catch (e) {
+        if (msgEl) { msgEl.textContent = `Error: ${e.message}`; msgEl.style.color = 'var(--color-error, #e53e3e)'; }
+      }
+    });
+  }
+
+  // The card is injected into static HTML so it's available immediately,
+  // but wire lazily in case the modal hasn't rendered yet.
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', _wire);
+  } else {
+    _wire();
+  }
+
+  // Also refresh status whenever the Integrations tab is clicked
+  document.addEventListener('click', e => {
+    const btn = e.target.closest('[data-settings-tab="integrations"]');
+    if (btn) setTimeout(_msGraphRefreshStatus, 100);
+  });
+})();
+
 const settingsModule = { open, close, initIntegrations, initUnifiedIntegrations, syncAdminVisibility, refreshAiModelEndpoints };
 
 
