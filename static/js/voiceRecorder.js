@@ -1,4 +1,5 @@
 // static/js/voiceRecorder.js
+import voiceCommandsModule from './voiceCommands.js';
 
 /**
  * Voice recording with optional Speech-to-Text transcription.
@@ -23,6 +24,9 @@ let _browserTranscript = '';
 // Cached STT provider — refreshed on settings change
 let _sttProvider = 'disabled';
 
+// Auto-send: when true, transcription is submitted immediately after recording
+let _sttAutoSend = false;
+
 /**
  * Fetch current STT provider from server settings
  */
@@ -37,6 +41,16 @@ async function refreshSttProvider() {
     }
   } catch (e) {
     console.warn('Failed to fetch STT stats:', e);
+  }
+  // Also refresh auto-send preference
+  try {
+    const res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
+    if (res.ok) {
+      const settings = await res.json();
+      _sttAutoSend = settings.stt_auto_send === true;
+    }
+  } catch (e) {
+    console.warn('Failed to fetch STT auto-send setting:', e);
   }
 }
 
@@ -128,10 +142,17 @@ async function transcribeOnServer(audioBlob) {
 }
 
 /**
- * Insert transcribed text into the chat input
+ * Insert transcribed text into the chat input.
+ * Checks voice commands first — if the text is a command it is executed
+ * and NOT inserted into the input.
+ * If stt_auto_send is enabled, submits the message automatically after insertion.
  */
 function insertTranscription(text, showToast) {
   if (!text) return;
+
+  // Try voice-command dispatch first
+  if (voiceCommandsModule.dispatch(text)) return;
+
   const input = document.getElementById('message');
   if (!input) return;
 
@@ -142,7 +163,20 @@ function insertTranscription(text, showToast) {
   input.dispatchEvent(new Event('input', { bubbles: true }));
   input.focus();
 
-  if (showToast) showToast('Transcribed');
+  if (_sttAutoSend) {
+    // Small delay to let the input event settle before submitting
+    setTimeout(() => {
+      const mockEvent = { preventDefault: () => {} };
+      if (window._voiceHandleSubmit) {
+        window._voiceHandleSubmit(mockEvent);
+      } else {
+        const form = document.getElementById('chat-form');
+        if (form) form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+      }
+    }, 80);
+  } else {
+    if (showToast) showToast('Transcribed');
+  }
 }
 
 /**
@@ -189,7 +223,7 @@ export function startRecording(onFileCreated, showToast, showError) {
             const audioFile = new File([audioBlob], `voice-message-${Date.now()}.webm`, { type: 'audio/webm' });
             if (onFileCreated) onFileCreated(audioFile);
           }
-        } else if (provider === 'local' || provider.startsWith('endpoint:')) {
+        } else if (provider === 'local' || provider === 'mlx' || provider.startsWith('endpoint:')) {
           // Show "Transcribing..." feedback
           if (showToast) showToast('Transcribing...', 5000);
           try {
@@ -202,12 +236,10 @@ export function startRecording(onFileCreated, showToast, showError) {
           } catch (e) {
             console.error('STT transcription error:', e);
             if (showError) showError('Transcription failed: ' + e.message);
-            // Fallback: attach as file
-            const audioFile = new File([audioBlob], `voice-message-${Date.now()}.webm`, { type: 'audio/webm' });
-            if (onFileCreated) onFileCreated(audioFile);
+            // No file fallback when STT is configured — avoid cluttering the input
           }
         } else {
-          // STT disabled — attach audio file
+          // STT disabled — attach audio file (original behaviour)
           const audioFile = new File([audioBlob], `voice-message-${Date.now()}.webm`, { type: 'audio/webm' });
           if (onFileCreated) onFileCreated(audioFile);
         }
@@ -278,6 +310,8 @@ const voiceRecorderModule = {
   refreshSttProvider,
   get _sttProvider() { return _sttProvider; },
   set _sttProvider(v) { _sttProvider = v; },
+  get _sttAutoSend() { return _sttAutoSend; },
+  set _sttAutoSend(v) { _sttAutoSend = !!v; },
 };
 
 export default voiceRecorderModule;

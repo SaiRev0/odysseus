@@ -44,11 +44,22 @@ trap 'echo; echo "✗ Setup failed above. It is safe to re-run ./start-macos.sh.
 
 echo "▶ Odysseus quick start for macOS"
 
-# Fail fast if the port is already taken (e.g. a previous run still running).
-if (exec 3<>"/dev/tcp/$PROBE_HOST/$PORT") 2>/dev/null; then
-    echo "✗ Port $PORT is already in use on $PROBE_HOST. Stop what's using it, or pick another port:"
-    echo "    ODYSSEUS_PORT=7900 ./start-macos.sh"
-    exit 1
+# Auto-advance to the next port if the requested one is already taken.
+# Tries up to 20 consecutive ports before giving up.
+_PORT_REQUESTED="$PORT"
+_PORT_LIMIT=$(( PORT + 20 ))
+while (exec 3<>"/dev/tcp/$PROBE_HOST/$PORT") 2>/dev/null; do
+    echo "  Port $PORT is in use on $PROBE_HOST — trying $(( PORT + 1 ))…"
+    PORT=$(( PORT + 1 ))
+    if [ "$PORT" -ge "$_PORT_LIMIT" ]; then
+        echo "✗ Ports $_PORT_REQUESTED–$(( _PORT_LIMIT - 1 )) are all in use on $PROBE_HOST."
+        echo "  Stop whatever is holding them, or pick a different base port:"
+        echo "    ODYSSEUS_PORT=7900 ./start-macos.sh"
+        exit 1
+    fi
+done
+if [ "$PORT" != "$_PORT_REQUESTED" ]; then
+    echo "  ✓ Using port $PORT instead of $_PORT_REQUESTED"
 fi
 
 # 1. Homebrew — the macOS package manager. We can't safely auto-install it
@@ -212,6 +223,39 @@ else
     echo "▶ ChromaDB CLI not found in venv; skipping (tool index will be degraded)."
 fi
 
+# SearXNG — optional, background, runs from its own sibling directory + venv.
+# Looks for perProjects/searxng (a sibling of perProjects/odysseus).
+# Set up once with: cd perProjects/searxng && make install
+# Default port: 8888 (set in searx/settings.yml).
+SEARXNG_PID=""
+SEARXNG_DIR="$(dirname "$REPO_DIR")/searxng"
+SEARXNG_LOG="${TMPDIR:-/tmp}/odysseus-searxng.log"
+if [ -d "$SEARXNG_DIR" ]; then
+    SEARXNG_VENV_PY="$SEARXNG_DIR/venv/bin/python"
+    SEARXNG_SETTINGS="$SEARXNG_DIR/searx/settings.yml"
+    if [ ! -x "$SEARXNG_VENV_PY" ]; then
+        echo "▶ SearXNG venv not found — skipping. Run: cd $SEARXNG_DIR && make install"
+    elif [ ! -f "$SEARXNG_SETTINGS" ]; then
+        echo "▶ SearXNG settings not found at $SEARXNG_SETTINGS — skipping."
+    elif (exec 3<>"/dev/tcp/127.0.0.1/8888") 2>/dev/null; then
+        echo "▶ SearXNG already running on 127.0.0.1:8888 — using it."
+        export SEARXNG_INSTANCE="http://127.0.0.1:8888"
+    else
+        echo "▶ Starting SearXNG in the background on 127.0.0.1:8888…"
+        echo "  logging to $SEARXNG_LOG"
+        # Must cd into searxng dir so Python finds the searx package from source.
+        _SEARXNG_PIDFILE="$(mktemp)"
+        (cd "$SEARXNG_DIR" && SEARXNG_SETTINGS_PATH="$SEARXNG_SETTINGS" \
+            nohup "$SEARXNG_VENV_PY" -m searx.webapp >"$SEARXNG_LOG" 2>&1 & echo $! >"$_SEARXNG_PIDFILE")
+        SEARXNG_PID="$(cat "$_SEARXNG_PIDFILE" 2>/dev/null)"
+        rm -f "$_SEARXNG_PIDFILE"
+        export SEARXNG_INSTANCE="http://127.0.0.1:8888"
+    fi
+else
+    echo "▶ SearXNG not found at $SEARXNG_DIR — skipping."
+    echo "  To enable: git clone https://github.com/searxng/searxng.git $SEARXNG_DIR && cd $SEARXNG_DIR && make install"
+fi
+
 # 5. Launch. Bind to loopback by default; opt into LAN/Tailscale with
 #    ODYSSEUS_HOST=0.0.0.0.
 URL_HOST="$HOST"
@@ -254,7 +298,7 @@ fi
 # Setup is done — drop the setup-failure handler, and clean up the background
 # opener when the server exits or the user presses Ctrl+C.
 trap - ERR
-trap '[ -n "$POLLER_PID" ] && kill "$POLLER_PID" 2>/dev/null; [ -n "$APFEL_PID" ] && kill "$APFEL_PID" 2>/dev/null; [ -n "$CHROMA_PID" ] && kill "$CHROMA_PID" 2>/dev/null' EXIT INT TERM
+trap '[ -n "$POLLER_PID" ] && kill "$POLLER_PID" 2>/dev/null; [ -n "$APFEL_PID" ] && kill "$APFEL_PID" 2>/dev/null; [ -n "$CHROMA_PID" ] && kill "$CHROMA_PID" 2>/dev/null; [ -n "$SEARXNG_PID" ] && kill "$SEARXNG_PID" 2>/dev/null' EXIT INT TERM
 
 echo
 echo "▶ Starting Odysseus — it will open in your browser at $URL"

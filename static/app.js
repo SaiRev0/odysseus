@@ -43,6 +43,7 @@ import * as researchPanelModule from './js/research/panel.js?v=20260630researcht
 import ttsModule from './js/tts-ai.js';
 import spinnerModule from './js/spinner.js';
 import { initKeyboardShortcuts } from './js/keyboard-shortcuts.js';
+import voiceCommandsModule from './js/voiceCommands.js';
 import { initSidebarLayout, syncRailSide } from './js/sidebar-layout.js';
 import { initSectionCollapse, initSectionDrag } from './js/section-management.js';
 
@@ -3439,7 +3440,8 @@ function initializeEventListeners() {
   initKeyboardShortcuts({
     el, Storage, sessionModule, uiModule, chatModule,
     adminModule, settingsModule, searchChatModule,
-    _closeCompareIfActive, _deactivateIncognito, API_BASE
+    _closeCompareIfActive, _deactivateIncognito, API_BASE,
+    voiceRecorderModule, fileHandlerModule,
   });
   
 }
@@ -3801,14 +3803,16 @@ function startOdysseusApp() {
         return;
       }
 
-      // If input is empty and STT is enabled, start recording
+      // If input is empty and STT is enabled, start recording.
+      // Pass null as onFileCreated — when STT is active we never want the audio
+      // attached as a file; the transcribed text goes straight into the input.
       if (!hasText && !hasFiles && _isSttEnabled()) {
         sendBtn.innerHTML = _stopIcon;
         sendBtn.title = 'Stop recording';
         sendBtn.dataset.mode = 'recording';
         sendBtn.classList.add('recording');
         voiceRecorderModule.startRecording(
-          (audioFile) => fileHandlerModule.addFiles([audioFile]),
+          null,
           uiModule.showToast,
           uiModule.showError
         );
@@ -3871,6 +3875,8 @@ function startOdysseusApp() {
 
   // Expose globally so voiceRecorder can trigger update after async fetch
   window._updateSendBtnIcon = _updateSendBtnIcon;
+  // Expose handleSubmit for the auto-send path in voiceRecorder.js
+  window._voiceHandleSubmit = handleSubmit;
 
   // Initial icon state
   _updateSendBtnIcon();
@@ -4071,6 +4077,12 @@ function startOdysseusApp() {
   // Ensure proper initial state
   voiceRecorderModule.init();
   if (censorModule) censorModule.init();
+
+  // Initialise voice command engine with module references so it can
+  // execute actions (send, new chat, switch session, incognito, TTS, cancel).
+  // Pass handleSubmit directly so the send command bypasses the keyboard-event
+  // shim and calls the real submit function.
+  voiceCommandsModule.init({ sessionModule, chatModule, uiModule, handleSubmit });
 
   // Auto-focus message input on load
   const msgEl = document.getElementById('message');

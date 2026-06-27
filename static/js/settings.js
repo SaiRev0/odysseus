@@ -895,6 +895,7 @@ async function initTtsSettings() {
   var speedRow = el('set-ttsSpeedRow');
   var ttsMsg = el('set-ttsSettingsMsg');
   var ttsEnabledToggle = el('set-ttsEnabledToggle');
+  var autoPlayToggle = el('set-ttsAutoPlayToggle');
   var ttsConfigWrap = provSel ? provSel.closest('div[style*="flex-direction"]') : null;
 
   function isEndpoint() { return provSel.value.startsWith('endpoint:'); }
@@ -935,6 +936,8 @@ async function initTtsSettings() {
     if (settings.tts_voice) { voiceSelect.value = settings.tts_voice; voiceInput.value = settings.tts_voice; }
     if (settings.tts_speed) { speedSelect.value = settings.tts_speed; }
     if (ttsEnabledToggle) ttsEnabledToggle.checked = settings.tts_enabled !== false;
+    if (autoPlayToggle) autoPlayToggle.checked = settings.tts_auto_play === true;
+    if (window.aiTTSManager) window.aiTTSManager.autoPlay = settings.tts_auto_play === true;
   } catch (e) { console.warn('Failed to load TTS settings', e); }
 
   function syncTtsDisabled() {
@@ -949,9 +952,20 @@ async function initTtsSettings() {
   async function saveTTS() {
     try {
       await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tts_enabled: ttsEnabledToggle ? ttsEnabledToggle.checked : true, tts_provider: provSel.value, tts_model: getModel() || 'tts-1', tts_voice: getVoice() || 'alloy', tts_speed: speedSelect.value || '1' }) });
+        body: JSON.stringify({
+          tts_enabled: ttsEnabledToggle ? ttsEnabledToggle.checked : true,
+          tts_provider: provSel.value,
+          tts_model: getModel() || 'tts-1',
+          tts_voice: getVoice() || 'alloy',
+          tts_speed: speedSelect.value || '1',
+          tts_auto_play: autoPlayToggle ? autoPlayToggle.checked : false,
+        }) });
       ttsMsg.textContent = 'Saved'; ttsMsg.style.color = 'var(--fg)'; setTimeout(() => { ttsMsg.textContent = ''; }, 2000);
-      if (window.aiTTSManager) window.aiTTSManager.checkAvailability();
+      // Sync autoPlay immediately without waiting for checkAvailability round-trip
+      if (window.aiTTSManager) {
+        window.aiTTSManager.autoPlay = autoPlayToggle ? autoPlayToggle.checked : false;
+        window.aiTTSManager.checkAvailability();
+      }
     } catch (e) { ttsMsg.textContent = 'Failed to save'; ttsMsg.style.color = 'var(--red)'; }
   }
 
@@ -974,6 +988,7 @@ async function initTtsSettings() {
   voiceInput.addEventListener('change', saveTTS);
   speedSelect.addEventListener('change', saveAndClearCache);
   if (ttsEnabledToggle) ttsEnabledToggle.addEventListener('change', function() { syncTtsDisabled(); saveTTS(); });
+  if (autoPlayToggle) autoPlayToggle.addEventListener('change', saveTTS);
 
   // Preview / test button
   var previewBtn = el('set-ttsPreviewBtn');
@@ -1052,6 +1067,7 @@ async function initSttSettings() {
   var sttMsg = el('set-sttSettingsMsg');
   var sttEnabledToggle = el('set-sttEnabledToggle');
   var sttConfigWrap = el('set-sttConfigWrap');
+  var autoSendToggle = el('set-sttAutoSendToggle');
   // STT was removed from AI Defaults — bail if the UI isn't present.
   if (!provSel) return;
 
@@ -1060,14 +1076,15 @@ async function initSttSettings() {
 
   function updateVisibility() {
     var prov = provSel.value;
-    var showModel = prov === 'local' || prov.startsWith('endpoint:');
+    var showModel = prov === 'local' || prov === 'mlx' || prov.startsWith('endpoint:');
     var showLang = prov !== 'disabled';
     modelRow.style.display = showModel ? 'flex' : 'none';
     langRow.style.display = showLang ? 'flex' : 'none';
     if (isEndpoint()) {
       modelSelect.style.display = 'none'; modelInput.style.display = '';
     } else {
-      modelSelect.style.display = ''; modelInput.style.display = 'none';
+      // For local/mlx: show free-text input so user can type base/small/turbo etc.
+      modelSelect.style.display = 'none'; modelInput.style.display = prov === 'local' || prov === 'mlx' ? '' : 'none';
     }
   }
 
@@ -1102,6 +1119,8 @@ async function initSttSettings() {
     if (settings.stt_model) { modelSelect.value = settings.stt_model; modelInput.value = settings.stt_model; }
     if (settings.stt_language) langInput.value = settings.stt_language;
     if (sttEnabledToggle) sttEnabledToggle.checked = settings.stt_enabled !== false;
+    if (autoSendToggle) autoSendToggle.checked = settings.stt_auto_send === true;
+    if (window.voiceRecorderModule) window.voiceRecorderModule._sttAutoSend = settings.stt_auto_send === true;
   } catch (e) { console.warn('Failed to load STT settings', e); }
 
   syncSttDisabled();
@@ -1112,10 +1131,19 @@ async function initSttSettings() {
       var enabled = sttEnabledToggle ? sttEnabledToggle.checked : false;
       await fetch('/api/auth/settings', { method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ stt_enabled: enabled, stt_provider: provSel.value, stt_model: getModel() || 'base', stt_language: langInput.value.trim() }) });
+        body: JSON.stringify({
+          stt_enabled: enabled,
+          stt_provider: provSel.value,
+          stt_model: getModel() || 'base',
+          stt_language: langInput.value.trim(),
+          stt_auto_send: autoSendToggle ? autoSendToggle.checked : false,
+        }) });
       sttMsg.textContent = 'Saved'; sttMsg.style.color = 'var(--fg)'; setTimeout(() => { sttMsg.textContent = ''; }, 2000);
-      // Notify voiceRecorder of effective provider and update send button icon
-      if (window.voiceRecorderModule) window.voiceRecorderModule._sttProvider = effectiveProvider();
+      // Notify voiceRecorder of effective provider, auto-send flag, and update send button icon
+      if (window.voiceRecorderModule) {
+        window.voiceRecorderModule._sttProvider = effectiveProvider();
+        window.voiceRecorderModule._sttAutoSend = autoSendToggle ? autoSendToggle.checked : false;
+      }
       if (window._updateSendBtnIcon) window._updateSendBtnIcon();
     } catch (e) { sttMsg.textContent = 'Failed to save'; sttMsg.style.color = 'var(--red)'; }
   }
@@ -1124,6 +1152,7 @@ async function initSttSettings() {
   modelSelect.addEventListener('change', saveSTT);
   modelInput.addEventListener('change', saveSTT);
   langInput.addEventListener('change', saveSTT);
+  if (autoSendToggle) autoSendToggle.addEventListener('change', saveSTT);
   if (sttEnabledToggle) sttEnabledToggle.addEventListener('change', function() { syncSttDisabled(); saveSTT(); });
 }
 
@@ -1831,6 +1860,7 @@ const SHORTCUT_DEFAULTS = {
   delete_session: 'ctrl+alt+d',
   cancel:         'escape',
   tts:            'alt+shift+t',
+  mic:            'ctrl+shift+m',
   incognito:      'ctrl+alt+i',
   settings:       'ctrl+,',
   focus_input:    'ctrl+/',
@@ -1856,6 +1886,7 @@ const SHORTCUT_ICONS = {
   delete_session: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
   cancel:         '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
   tts:            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>',
+  mic:            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>',
   incognito:      '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><line x1="8" y1="16" x2="16" y2="8"/><line x1="8" y1="8" x2="16" y2="16"/></svg>',
   settings:       '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
   focus_input:    '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
@@ -1879,6 +1910,7 @@ const SHORTCUT_LABELS = {
   delete_session: 'Delete session',
   cancel:         'Cancel / close',
   tts:            'Play/stop TTS',
+  mic:            'Toggle microphone (STT)',
   incognito:      'Toggle incognito',
   settings:       'Toggle Window',
   focus_input:    'Focus chat input',
@@ -1897,7 +1929,7 @@ const SHORTCUT_LABELS = {
 const SHORTCUT_CATEGORIES = [
   { name: 'Navigation', keys: ['search', 'toggle_sidebar', 'focus_input', 'settings'] },
   { name: 'Sessions', keys: ['new_session', 'fav_session', 'delete_session'] },
-  { name: 'Tools', keys: ['incognito', 'tts', 'cancel'] },
+  { name: 'Tools', keys: ['incognito', 'tts', 'mic', 'cancel'] },
   { name: 'Open Tools', keys: ['open_calendar', 'open_compare', 'open_cookbook', 'open_research', 'open_gallery', 'open_library', 'open_memory', 'open_notes', 'open_tasks', 'open_theme'] },
 ];
 

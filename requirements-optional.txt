@@ -12,6 +12,21 @@
 # GPU-accelerated transcription — it's auto-detected, CPU is used otherwise.
 faster-whisper
 
+# Local STT on Apple Silicon (M1/M2/M3/M4) via MLX, for the "mlx" STT
+# provider. Uses Apple's MLX framework and Metal GPU — dramatically faster
+# than faster-whisper on M-series chips. Only works on macOS with Apple
+# Silicon; falls back to a clear error on other platforms.
+mlx-whisper
+
+# Local TTS via kokoro-onnx, for the "local" TTS provider. Runs the
+# Kokoro-82M model through ONNX Runtime — works on CPU and Apple Silicon
+# (CoreML/Metal via onnxruntime) without requiring a CUDA GPU.
+# After installing, download the model files:
+#   wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+#   wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+# Place both files in the project root (or set the path in tts_service.py).
+kokoro-onnx
+
 # DuckDuckGo as a search provider option.
 # Install if you want DDG in the search-provider dropdown.
 # Alternatives: SearXNG, Brave, Tavily, Serper, Google PSE.
