@@ -307,4 +307,10 @@ if [ -n "$TAILSCALE_URL" ]; then
 fi
 echo "  (this takes a few seconds; press Ctrl+C here to stop)"
 echo
-"$VENV_PY" -m uvicorn app:app --host "$HOST" --port "$PORT"
+"$VENV_PY" -m uvicorn app:app --host "$HOST" --port "$PORT" \
+    --reload \
+    --reload-dir "$REPO_DIR/src" \
+    --reload-dir "$REPO_DIR/routes" \
+    --reload-dir "$REPO_DIR/services" \
+    --reload-dir "$REPO_DIR/mcp_servers" \
+    --reload-include "*.py"
