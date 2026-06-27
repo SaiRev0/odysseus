@@ -39,6 +39,10 @@ caldav
 cryptography
 bcrypt
 mcp
+# Microsoft Authentication Library — used by mcp_servers/msgraph_server.py
+# and routes/msgraph_routes.py for the Microsoft Graph OAuth flow.
+msal
+requests
 pyotp
 qrcode[pil]
 croniter

@@ -1510,7 +1510,9 @@ def _sanitize_llm_messages(messages: List[Dict]) -> List[Dict]:
         last = merged[-1]
         if last.get("role") == "user" and item.get("role") == "user":
             if _is_untrusted_context_content(last.get("content")):
-                merged.append({"role": "assistant", "content": _REFERENCE_CONTEXT_BOUNDARY})
+                merged.append(
+                    {"role": "assistant", "content": _REFERENCE_CONTEXT_BOUNDARY}
+                )
                 merged.append(item)
                 continue
             last_copy = dict(last)
@@ -2078,6 +2080,22 @@ async def llm_call_async(
                         f"(model={model} rejected max_tokens)"
                     )
                     continue
+                # OpenAI: some models (o-series, gpt-5, etc.) reject any explicit
+                # temperature value — "Only the default (1) value is supported".
+                # The static _omit_temperature check covers known model names, but
+                # aliases or newly-released variants may slip through. Detect at
+                # runtime and retry once without the field.
+                if (
+                    r.status_code == 400
+                    and "temperature" in r.text
+                    and "temperature" in payload
+                ):
+                    payload.pop("temperature")
+                    logger.info(
+                        f"Retrying {target_url} without temperature "
+                        f"(model={model} rejected custom temperature)"
+                    )
+                    continue
                 if r.status_code in (429, 502, 503, 504) and attempt < max_retries:
                     await asyncio.sleep(LLMConfig.RETRY_DELAY)
                     continue
@@ -2571,35 +2589,54 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         return events
 
     h = apply_kimi_code_headers(h, target_url)
+    _stream_temperature_stripped = False
     try:
-        client = _get_http_client()
-        async with client.stream(
-            "POST", target_url, json=payload, headers=h, timeout=stream_timeout
-        ) as r:
-            _clear_host_dead(target_url)
-            if r.status_code != 200:
-                raw = (await r.aread()).decode(errors="replace")
-                friendly = _format_upstream_error(r.status_code, raw, target_url)
-                yield f"event: error\ndata: {json.dumps({'status': r.status_code, 'text': friendly, 'raw': raw[:500]})}\n\n"
-                return
+        for _stream_attempt in range(2):
+            client = _get_http_client()
+            async with client.stream(
+                "POST", target_url, json=payload, headers=h, timeout=stream_timeout
+            ) as r:
+                _clear_host_dead(target_url)
+                if r.status_code != 200:
+                    raw = (await r.aread()).decode(errors="replace")
+                    # OpenAI: some model aliases reject any explicit temperature at
+                    # runtime even when the static check passed. Strip and retry once.
+                    if (
+                        r.status_code == 400
+                        and "temperature" in raw
+                        and "temperature" in payload
+                        and not _stream_temperature_stripped
+                    ):
+                        payload.pop("temperature")
+                        _stream_temperature_stripped = True
+                        logger.info(
+                            f"stream_llm: retrying {target_url} without temperature "
+                            f"(model={model} rejected custom temperature)"
+                        )
+                        continue
+                    friendly = _format_upstream_error(r.status_code, raw, target_url)
+                    yield f"event: error\ndata: {json.dumps({'status': r.status_code, 'text': friendly, 'raw': raw[:500]})}\n\n"
+                    return
 
-            async for line in r.aiter_lines():
-                if not line:
-                    continue
+                async for line in r.aiter_lines():
+                    if not line:
+                        continue
 
-                # SSE allows "data:value" with no space after the colon; gating
-                # on "data: " silently dropped content + usage from providers
-                # that omit it.
-                if line.startswith("data:"):
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        for event in _format_routed_content(_harmony_router.flush()):
-                            yield event
-                        tc_event = _emit_tool_calls()
-                        if tc_event:
-                            yield tc_event
-                        yield "data: [DONE]\n\n"
-                        return
+                    # SSE allows "data:value" with no space after the colon; gating
+                    # on "data: " silently dropped content + usage from providers
+                    # that omit it.
+                    if line.startswith("data:"):
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            for event in _format_routed_content(
+                                _harmony_router.flush()
+                            ):
+                                yield event
+                            tc_event = _emit_tool_calls()
+                            if tc_event:
+                                yield tc_event
+                            yield "data: [DONE]\n\n"
+                            return
 
                     try:
                         if data.strip():
@@ -2743,144 +2780,154 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                                                                 think_part.lower().find(
                                                                     ">"
                                                                 )
-                                                            )
-                                                            if tag_end != -1:
-                                                                think_part = think_part[
-                                                                    tag_end + 1 :
-                                                                ]
-                                                            _think_open_stripped = True
-                                                        regular_part = content[
-                                                            close_idx
-                                                            + len("</think>") :
-                                                        ]
-                                                        _in_think_tag = False
-                                                        if think_part:
-                                                            yield f"data: {json.dumps({'delta': think_part, 'thinking': True})}\n\n"
-                                                        if regular_part:
-                                                            _first_content_sent = True
-                                                            yield f"data: {json.dumps({'delta': regular_part})}\n\n"
-                                                    else:
-                                                        # Still inside <think>: route to thinking channel
-                                                        if not _think_open_stripped:
-                                                            # Strip the opening <think[...] > tag (first chunk only)
-                                                            tag_end = (
-                                                                stripped.lower().find(
+                                                                if tag_end != -1:
+                                                                    think_part = (
+                                                                        think_part[
+                                                                            tag_end
+                                                                            + 1 :
+                                                                        ]
+                                                                    )
+                                                                _think_open_stripped = (
+                                                                    True
+                                                                )
+                                                            regular_part = content[
+                                                                close_idx
+                                                                + len("</think>") :
+                                                            ]
+                                                            _in_think_tag = False
+                                                            if think_part:
+                                                                yield f"data: {json.dumps({'delta': think_part, 'thinking': True})}\n\n"
+                                                            if regular_part:
+                                                                _first_content_sent = (
+                                                                    True
+                                                                )
+                                                                yield f"data: {json.dumps({'delta': regular_part})}\n\n"
+                                                        else:
+                                                            # Still inside <think>: route to thinking channel
+                                                            if not _think_open_stripped:
+                                                                # Strip the opening <think[...] > tag (first chunk only)
+                                                                tag_end = stripped.lower().find(
                                                                     ">"
                                                                 )
+                                                                if tag_end != -1:
+                                                                    content = stripped[
+                                                                        tag_end + 1 :
+                                                                    ]
+                                                                _think_open_stripped = (
+                                                                    True
+                                                                )
+                                                            if content:
+                                                                yield f"data: {json.dumps({'delta': content, 'thinking': True})}\n\n"
+                                                    else:
+                                                        # Some thinking backends start normal content with a
+                                                        # stray closing tag. Repair only that shape; do not
+                                                        # wrap every first token for model families like
+                                                        # MiniMax, which often stream ordinary answers.
+                                                        if (
+                                                            _thinking_model
+                                                            and not _first_content_sent
+                                                            and stripped.lower().startswith(
+                                                                "</think"
                                                             )
-                                                            if tag_end != -1:
-                                                                content = stripped[
-                                                                    tag_end + 1 :
-                                                                ]
-                                                            _think_open_stripped = True
-                                                        if content:
-                                                            yield f"data: {json.dumps({'delta': content, 'thinking': True})}\n\n"
-                                                else:
-                                                    # Some thinking backends start normal content with a
-                                                    # stray closing tag. Repair only that shape; do not
-                                                    # wrap every first token for model families like
-                                                    # MiniMax, which often stream ordinary answers.
+                                                        ):
+                                                            content = (
+                                                                "<think>" + content
+                                                            )
+                                                        _first_content_sent = True
+                                                        yield f"data: {json.dumps({'delta': content})}\n\n"
+                                            # Native tool calls — accumulate across chunks
+                                            for tc in delta.get("tool_calls") or []:
+                                                if tc is None:
+                                                    continue
+                                                func = tc.get("function") or {}
+                                                raw_idx = tc.get("index")
+                                                if raw_idx is None:
+                                                    # Gemini's OpenAI-compat layer omits `index` on
+                                                    # parallel tool calls (every delta arrives as
+                                                    # index=None) and sends each call complete in one
+                                                    # delta. Without this, all parallel calls collide
+                                                    # into slot 0 — later calls overwrite the first's
+                                                    # name and CORRUPT its arguments by concatenation,
+                                                    # so only one malformed call survives and the
+                                                    # follow-up round 400s. A function name marks the
+                                                    # start of a new call → allocate a fresh slot;
+                                                    # an arg-only continuation attaches to the last.
                                                     if (
-                                                        _thinking_model
-                                                        and not _first_content_sent
-                                                        and stripped.lower().startswith(
-                                                            "</think"
-                                                        )
+                                                        func.get("name")
+                                                        or _tc_last_idx[0] < 0
                                                     ):
-                                                        content = "<think>" + content
-                                                    _first_content_sent = True
-                                                    yield f"data: {json.dumps({'delta': content})}\n\n"
-                                        # Native tool calls — accumulate across chunks
-                                        for tc in delta.get("tool_calls") or []:
-                                            if tc is None:
-                                                continue
-                                            func = tc.get("function") or {}
-                                            raw_idx = tc.get("index")
-                                            if raw_idx is None:
-                                                # Gemini's OpenAI-compat layer omits `index` on
-                                                # parallel tool calls (every delta arrives as
-                                                # index=None) and sends each call complete in one
-                                                # delta. Without this, all parallel calls collide
-                                                # into slot 0 — later calls overwrite the first's
-                                                # name and CORRUPT its arguments by concatenation,
-                                                # so only one malformed call survives and the
-                                                # follow-up round 400s. A function name marks the
-                                                # start of a new call → allocate a fresh slot;
-                                                # an arg-only continuation attaches to the last.
-                                                if (
-                                                    func.get("name")
-                                                    or _tc_last_idx[0] < 0
-                                                ):
-                                                    # Next free slot ABOVE any existing key (not
-                                                    # len()), so a provider mixing integer indices
-                                                    # with index=None can never collide.
-                                                    idx = max(_tc_acc, default=-1) + 1
+                                                        # Next free slot ABOVE any existing key (not
+                                                        # len()), so a provider mixing integer indices
+                                                        # with index=None can never collide.
+                                                        idx = (
+                                                            max(_tc_acc, default=-1) + 1
+                                                        )
+                                                    else:
+                                                        idx = _tc_last_idx[0]
                                                 else:
-                                                    idx = _tc_last_idx[0]
-                                            else:
-                                                idx = raw_idx
-                                            _tc_last_idx[0] = idx
-                                            if idx not in _tc_acc:
-                                                _tc_acc[idx] = {
-                                                    "id": "",
-                                                    "name": "",
-                                                    "arguments": "",
-                                                }
-                                            if tc.get("id"):
-                                                _tc_acc[idx]["id"] = tc["id"]
-                                            # Gemini 3 returns an opaque thought_signature in
-                                            # extra_content on the function-call delta. It MUST be
-                                            # echoed back on the assistant tool_call next round or the
-                                            # follow-up request 400s ("Function call is missing a
-                                            # thought_signature"). Preserve it verbatim; other
-                                            # providers never send it, so this is a no-op for them.
-                                            if tc.get("extra_content"):
-                                                _tc_acc[idx]["extra_content"] = tc[
-                                                    "extra_content"
-                                                ]
-                                            if func.get("name"):
-                                                _tc_acc[idx]["name"] = func["name"]
-                                            if "arguments" in func:
-                                                # Guard against a null arguments delta: `func` can be
-                                                # {"arguments": None} (JSON null), and a raw `+= None`
-                                                # raises TypeError that the broad except swallows,
-                                                # silently dropping the rest of the chunk. Matches the
-                                                # Anthropic accumulator (`partial = ... or ""`) above.
-                                                _tc_acc[idx]["arguments"] += (
-                                                    func["arguments"] or ""
-                                                )
-                                                # Stream tool arg deltas for doc tools
-                                                if func["arguments"] and _tc_acc[
-                                                    idx
-                                                ].get("name") in (
-                                                    "create_document",
-                                                    "update_document",
-                                                    "edit_document",
-                                                ):
-                                                    yield f"data: {json.dumps({'type': 'tool_call_delta', 'index': idx, 'name': _tc_acc[idx]['name'], 'arg_delta': func['arguments']})}\n\n"
-                                elif "text" in j:
-                                    if j["text"]:
+                                                    idx = raw_idx
+                                                _tc_last_idx[0] = idx
+                                                if idx not in _tc_acc:
+                                                    _tc_acc[idx] = {
+                                                        "id": "",
+                                                        "name": "",
+                                                        "arguments": "",
+                                                    }
+                                                if tc.get("id"):
+                                                    _tc_acc[idx]["id"] = tc["id"]
+                                                # Gemini 3 returns an opaque thought_signature in
+                                                # extra_content on the function-call delta. It MUST be
+                                                # echoed back on the assistant tool_call next round or the
+                                                # follow-up request 400s ("Function call is missing a
+                                                # thought_signature"). Preserve it verbatim; other
+                                                # providers never send it, so this is a no-op for them.
+                                                if tc.get("extra_content"):
+                                                    _tc_acc[idx]["extra_content"] = tc[
+                                                        "extra_content"
+                                                    ]
+                                                if func.get("name"):
+                                                    _tc_acc[idx]["name"] = func["name"]
+                                                if "arguments" in func:
+                                                    # Guard against a null arguments delta: `func` can be
+                                                    # {"arguments": None} (JSON null), and a raw `+= None`
+                                                    # raises TypeError that the broad except swallows,
+                                                    # silently dropping the rest of the chunk. Matches the
+                                                    # Anthropic accumulator (`partial = ... or ""`) above.
+                                                    _tc_acc[idx]["arguments"] += (
+                                                        func["arguments"] or ""
+                                                    )
+                                                    # Stream tool arg deltas for doc tools
+                                                    if func["arguments"] and _tc_acc[
+                                                        idx
+                                                    ].get("name") in (
+                                                        "create_document",
+                                                        "update_document",
+                                                        "edit_document",
+                                                    ):
+                                                        yield f"data: {json.dumps({'type': 'tool_call_delta', 'index': idx, 'name': _tc_acc[idx]['name'], 'arg_delta': func['arguments']})}\n\n"
+                                    elif "text" in j:
+                                        if j["text"]:
+                                            for event in _format_routed_content(
+                                                _harmony_router.feed(j["text"])
+                                            ):
+                                                yield event
+                                else:
+                                    if data.strip():
                                         for event in _format_routed_content(
-                                            _harmony_router.feed(j["text"])
+                                            _harmony_router.feed(data)
                                         ):
                                             yield event
-                            else:
-                                if data.strip():
-                                    for event in _format_routed_content(
-                                        _harmony_router.feed(data)
-                                    ):
-                                        yield event
-                    except Exception as e:
-                        logger.error(f"Error parsing stream data: {e}")
-                        continue
+                        except Exception as e:
+                            logger.error(f"Error parsing stream data: {e}")
+                            continue
 
-            # End of stream (no explicit [DONE] received)
-            for event in _format_routed_content(_harmony_router.flush()):
-                yield event
-            tc_event = _emit_tool_calls()
-            if tc_event:
-                yield tc_event
-            yield "data: [DONE]\n\n"
+                # End of stream (no explicit [DONE] received)
+                for event in _format_routed_content(_harmony_router.flush()):
+                    yield event
+                tc_event = _emit_tool_calls()
+                if tc_event:
+                    yield tc_event
+                yield "data: [DONE]\n\n"
 
     except (httpx.ConnectError, httpx.ConnectTimeout) as e:
         _cooled = _mark_host_dead(target_url)
