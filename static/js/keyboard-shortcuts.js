@@ -7,7 +7,7 @@ import { IS_MAC, isAltGrEvent } from './platform.js';
 const _defaultKeybinds = {
   search: 'ctrl+k', toggle_sidebar: 'ctrl+alt+b', new_session: 'ctrl+alt+n',
   fav_session: 'ctrl+alt+f', delete_session: 'ctrl+alt+d',
-  cancel: 'escape', tts: 'alt+shift+t',
+  cancel: 'escape', tts: 'alt+shift+t', mic: 'ctrl+shift+m',
   incognito: 'ctrl+alt+i', settings: 'ctrl+,', focus_input: 'ctrl+/',
   // Open-tool shortcuts (Calendar bound by default; rest unbound).
   open_calendar: 'ctrl+alt+c', open_compare: '', open_cookbook: '',
@@ -50,7 +50,8 @@ export function initKeyboardShortcuts(modules) {
   const {
     el, Storage, sessionModule, uiModule, chatModule,
     adminModule, settingsModule, searchChatModule,
-    _closeCompareIfActive, _deactivateIncognito, API_BASE
+    _closeCompareIfActive, _deactivateIncognito, API_BASE,
+    voiceRecorderModule, fileHandlerModule,
   } = modules;
 
   window._odysseusKeybinds = { ..._defaultKeybinds };
@@ -173,6 +174,40 @@ export function initKeyboardShortcuts(modules) {
       for (var i = allAI.length - 1; i >= 0; i--) {
         var ttsBtn = allAI[i].querySelector('.ai-tts-button');
         if (ttsBtn) { ttsBtn.click(); return; }
+      }
+      return;
+    }
+    if (_matchesCombo(e, kb.mic)) {
+      e.preventDefault();
+      // If already recording, stop
+      if (voiceRecorderModule && voiceRecorderModule.getIsRecording()) {
+        voiceRecorderModule.stopRecording();
+        return;
+      }
+      // Only start if STT provider is configured
+      const provider = voiceRecorderModule && voiceRecorderModule._sttProvider;
+      if (!provider || provider === 'disabled') {
+        if (uiModule) uiModule.showToast('Enable STT in Settings → AI Defaults first');
+        return;
+      }
+      // Focus the chat input so transcription is inserted there
+      const msgInput = document.getElementById('message');
+      if (msgInput) msgInput.focus();
+      // Visual feedback on send button
+      const sendBtn = document.querySelector('.send-btn');
+      const _stopIcon = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>';
+      if (sendBtn) {
+        sendBtn.innerHTML = _stopIcon;
+        sendBtn.title = 'Stop recording';
+        sendBtn.dataset.mode = 'recording';
+        sendBtn.classList.add('recording');
+      }
+      if (voiceRecorderModule) {
+        voiceRecorderModule.startRecording(
+          fileHandlerModule ? (f) => fileHandlerModule.addFiles([f]) : null,
+          uiModule ? uiModule.showToast : null,
+          uiModule ? uiModule.showError : null
+        );
       }
       return;
     }

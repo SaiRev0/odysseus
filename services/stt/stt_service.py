@@ -11,6 +11,48 @@ from typing import Optional, Dict, Any
 logger = logging.getLogger(__name__)
 
 
+def _is_hallucination(text: str) -> bool:
+    """Detect Whisper hallucination loops — e.g. 'emb emb emb emb...' or
+    'Thank you. Thank you. Thank you...' repeated dozens of times.
+
+    Returns True if the transcription looks like a stuck-token hallucination
+    and should be discarded.
+    """
+    if not text:
+        return False
+    words = text.split()
+    if len(words) < 6:
+        return False
+
+    # Count how often the single most-frequent word appears
+    from collections import Counter
+
+    counts = Counter(w.lower().strip(".,!?") for w in words)
+    top_word, top_count = counts.most_common(1)[0]
+    # If one word makes up > 40% of a transcript longer than 20 words, it's a loop
+    if len(words) > 20 and top_count / len(words) > 0.40:
+        logger.warning(
+            f"STT hallucination detected: '{top_word}' repeated {top_count}/{len(words)} times — discarding"
+        )
+        return True
+
+    # Detect short repeating n-gram patterns (bigrams / trigrams)
+    for n in (2, 3):
+        ngrams = [tuple(words[i : i + n]) for i in range(len(words) - n + 1)]
+        if not ngrams:
+            continue
+        ngram_counts = Counter(ngrams)
+        top_ngram, top_ng_count = ngram_counts.most_common(1)[0]
+        # If the top n-gram accounts for > 35% of all n-grams it's a loop
+        if top_ng_count / len(ngrams) > 0.35 and top_ng_count >= 5:
+            logger.warning(
+                f"STT hallucination detected: {top_ngram} repeated {top_ng_count} times — discarding"
+            )
+            return True
+
+    return False
+
+
 class STTService:
     """Multi-provider STT service.
 
@@ -19,16 +61,19 @@ class STTService:
       "disabled"        — no STT
       "browser"         — client-side Web Speech API (no server transcription)
       "local"           — faster-whisper on CPU/GPU
+      "mlx"             — mlx-whisper on Apple Silicon (M-series, Metal)
       "endpoint:<id>"   — OpenAI-compatible /audio/transcriptions via ModelEndpoint
     """
 
     def __init__(self):
-        self._whisper_model = None  # lazy-init
+        self._whisper_model = None  # lazy-init for faster-whisper
+        self._mlx_model_name = None  # tracks which mlx model is loaded
 
     # ── Settings ──
 
     def _load_settings(self) -> dict:
         from src.settings import load_settings
+
         saved = load_settings()
         return {
             "stt_enabled": saved.get("stt_enabled", False),
@@ -49,18 +94,87 @@ class STTService:
             return True  # handled client-side
         if provider == "local":
             return self._get_whisper() is not None
+        if provider == "mlx":
+            return self._check_mlx_available()
         if provider.startswith("endpoint:"):
             return True  # assume reachable
         return False
 
-    # ── Local Whisper ──
+    # ── MLX Whisper (Apple Silicon) ──
+
+    def _check_mlx_available(self) -> bool:
+        try:
+            import mlx_whisper  # noqa: F401
+
+            return True
+        except ImportError:
+            return False
+
+    def _transcribe_mlx(
+        self, audio_bytes: bytes, model: str = "base", language: str = ""
+    ) -> Optional[str]:
+        try:
+            import mlx_whisper
+        except ImportError:
+            logger.warning(
+                "mlx-whisper not installed. Install with: pip install mlx-whisper"
+            )
+            return None
+
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+                tmp.write(audio_bytes)
+                tmp_path = tmp.name
+
+            # mlx_whisper uses HuggingFace-style model path names.
+            # Map short names to mlx-community HF repos; "turbo" is the
+            # default because the user already has it cached at
+            # ~/.cache/huggingface/hub/models--mlx-community--whisper-large-v3-turbo.
+            _model_map = {
+                "base": "mlx-community/whisper-base-mlx",
+                "small": "mlx-community/whisper-small-mlx",
+                "medium": "mlx-community/whisper-medium-mlx",
+                "large": "mlx-community/whisper-large-v3-mlx",
+                "turbo": "mlx-community/whisper-large-v3-turbo",
+            }
+            # If the stored model name is blank or "base" but the turbo
+            # weights are already in the HF cache, prefer turbo.
+            effective = model if model else "turbo"
+            mlx_model = _model_map.get(effective, effective)
+
+            kwargs = {
+                "path_or_hf_repo": mlx_model,
+                # Disable feeding previous output back as context — the main
+                # cause of "emb emb emb..." / "Thank you. Thank you." loops.
+                "condition_on_previous_text": False,
+            }
+            if language:
+                kwargs["language"] = language
+
+            result = mlx_whisper.transcribe(tmp_path, **kwargs)
+            text = result.get("text", "").strip()
+            if _is_hallucination(text):
+                return None
+            logger.info(f"MLX Whisper STT: {len(text)} chars, model={mlx_model}")
+            return text
+        except Exception as e:
+            logger.error(f"MLX Whisper transcription failed: {e}", exc_info=True)
+            return None
+        finally:
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
+
+    # ── Local Whisper (faster-whisper, CPU/CUDA) ──
 
     def _get_whisper(self):
         if self._whisper_model is None:
             try:
                 from faster_whisper import WhisperModel
             except ImportError:
-                logger.warning("faster-whisper not installed. Install with: pip install faster-whisper")
+                logger.warning(
+                    "faster-whisper not installed. Install with: pip install faster-whisper"
+                )
                 return None
             try:
                 settings = self._load_settings()
@@ -75,19 +189,24 @@ class STTService:
                 # "faster-whisper not installed" error.
                 try:
                     import torch
+
                     use_cuda = torch.cuda.is_available()
                 except Exception:
                     use_cuda = False
                 device = "cuda" if use_cuda else "cpu"
                 compute_type = "float16" if device == "cuda" else "int8"
-                self._whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
+                self._whisper_model = WhisperModel(
+                    model_size, device=device, compute_type=compute_type
+                )
                 logger.info(f"faster-whisper model '{model_size}' loaded on {device}")
             except Exception as e:
                 logger.error(f"Failed to load whisper model: {e}")
                 return None
         return self._whisper_model
 
-    def _transcribe_local(self, audio_bytes: bytes, language: str = "") -> Optional[str]:
+    def _transcribe_local(
+        self, audio_bytes: bytes, language: str = ""
+    ) -> Optional[str]:
         model = self._get_whisper()
         if not model:
             return None
@@ -105,7 +224,11 @@ class STTService:
             segments, info = model.transcribe(tmp_path, **kwargs)
             text = " ".join(seg.text.strip() for seg in segments)
 
-            logger.info(f"Local STT: {len(text)} chars, lang={info.language}, prob={info.language_probability:.2f}")
+            if _is_hallucination(text):
+                return None
+            logger.info(
+                f"Local STT: {len(text)} chars, lang={info.language}, prob={info.language_probability:.2f}"
+            )
             return text
         except Exception as e:
             logger.error(f"Local STT transcription failed: {e}", exc_info=True)
@@ -116,7 +239,9 @@ class STTService:
 
     # ── API endpoint ──
 
-    def _transcribe_api(self, audio_bytes: bytes, endpoint_id: str, model: str, language: str = "") -> Optional[str]:
+    def _transcribe_api(
+        self, audio_bytes: bytes, endpoint_id: str, model: str, language: str = ""
+    ) -> Optional[str]:
         from src.database import SessionLocal, ModelEndpoint
 
         db = SessionLocal()
@@ -166,6 +291,8 @@ class STTService:
 
         if provider == "local":
             return self._transcribe_local(audio_bytes, language)
+        elif provider == "mlx":
+            return self._transcribe_mlx(audio_bytes, model, language)
         elif provider.startswith("endpoint:"):
             endpoint_id = provider.split(":", 1)[1]
             return self._transcribe_api(audio_bytes, endpoint_id, model, language)
@@ -190,6 +317,9 @@ class STTService:
         if provider == "local":
             whisper = self._get_whisper()
             stats["model_loaded"] = whisper is not None
+        elif provider == "mlx":
+            stats["model_loaded"] = self._check_mlx_available()
+            stats["model"] = f"mlx-whisper ({settings['stt_model']})"
         elif provider == "browser":
             stats["model"] = "Browser (Web Speech API)"
         elif provider.startswith("endpoint:"):
@@ -200,6 +330,7 @@ class STTService:
 
 # Module-level singleton
 _stt_service = None
+
 
 def get_stt_service() -> STTService:
     global _stt_service

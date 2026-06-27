@@ -45,6 +45,62 @@ else
   echo "  icon:        (skipped — no docs/odysseus.jpg)"
 fi
 
+# ── Native WKWebView helper (OdysseusUI) ──
+# Compiles a tiny Swift binary that opens a proper app-window using WebKit.
+# This runs as part of the Odysseus.app process so macOS shows Odysseus's icon
+# instead of Chrome's (which happens when we use Chrome's --app= flag).
+SWIFT_SRC="$(mktemp /tmp/OdysseusUI_XXXXXX.swift)"
+cat > "$SWIFT_SRC" <<'SWIFT'
+import Cocoa
+import WebKit
+
+class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
+    var window: NSWindow!
+    var webView: WKWebView!
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let url = CommandLine.arguments.count > 1
+            ? URL(string: CommandLine.arguments[1])!
+            : URL(string: "http://127.0.0.1:7860")!
+
+        let config = WKWebViewConfiguration()
+        config.preferences.setValue(true, forKey: "developerExtrasEnabled")
+
+        webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = self
+        webView.load(URLRequest(url: url))
+
+        window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1280, height: 800),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Odysseus"
+        window.contentView = webView
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+}
+
+let delegate = AppDelegate()
+NSApplication.shared.delegate = delegate
+NSApplication.shared.run()
+SWIFT
+
+HELPER="$APP/Contents/MacOS/OdysseusUI"
+echo "Building OdysseusUI helper…"
+if swiftc -O -o "$HELPER" "$SWIFT_SRC" \
+    -framework Cocoa -framework WebKit 2>/dev/null; then
+    echo "  ✓ OdysseusUI compiled"
+else
+    echo "  ⚠ swiftc not found or failed — falling back to system browser for UI window"
+fi
+rm -f "$SWIFT_SRC"
+
 # ── Info.plist ──
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -62,6 +118,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key>  <string>11.0</string>
     <key>NSHighResolutionCapable</key> <true/>
     <key>LSUIElement</key>             <false/>
+    <key>LSArchitecturePriority</key>
+    <array>
+        <string>arm64</string>
+        <string>x86_64</string>
+    </array>
 </dict>
 </plist>
 PLIST
@@ -70,6 +131,13 @@ PLIST
 cat > "$APP/Contents/MacOS/$APP_NAME.tmpl" <<'LAUNCHER'
 #!/bin/bash
 # Odysseus.app — start the local server and open the UI in an app window.
+
+# On Apple Silicon, .app bundles can be launched as x86_64 (Rosetta) even when
+# the venv was built for arm64 — causing dlopen errors. Re-exec as arm64 if needed.
+if [ "$(uname -m)" != "arm64" ] && /usr/bin/arch -arm64 /bin/true 2>/dev/null; then
+  exec /usr/bin/arch -arm64 "$0" "$@"
+fi
+
 INSTALL_DIR="__INSTALL_DIR__"
 PORT="__PORT__"
 URL="http://127.0.0.1:${PORT}"
@@ -91,22 +159,16 @@ python3.11 -m venv venv
 ./venv/bin/pip install -r requirements.txt
 ./venv/bin/python setup.py"
 
-# Open the UI in a chrome-less app window (Chromium browsers), else default browser.
+# Open the UI using the bundled native WKWebView helper (shows Odysseus icon,
+# not Chrome's). Falls back to the system browser if the helper is missing.
 open_ui() {
-  local b base exe bin
-  for b in "Google Chrome" "Microsoft Edge" "Brave Browser" "Chromium"; do
-    for base in "/Applications" "$HOME/Applications"; do
-      if [ -d "$base/$b.app" ]; then
-        exe="$(/usr/bin/defaults read "$base/$b.app/Contents/Info" CFBundleExecutable 2>/dev/null)"
-        bin="$base/$b.app/Contents/MacOS/$exe"
-        if [ -x "$bin" ]; then
-          "$bin" --app="$URL" --new-window >/dev/null 2>&1 &
-          return 0
-        fi
-      fi
-    done
-  done
-  /usr/bin/open "$URL"
+  local helper
+  helper="$(dirname "$0")/OdysseusUI"
+  if [ -x "$helper" ]; then
+    "$helper" "$URL" &
+  else
+    /usr/bin/open "$URL"
+  fi
 }
 
 mkdir -p "$INSTALL_DIR/logs"
@@ -119,6 +181,28 @@ fi
 
 notify "Starting…"
 cd "$INSTALL_DIR" || die_gui "Install folder not found: $INSTALL_DIR"
+
+# ── SearXNG (background, optional) ──
+# Expects searxng cloned as a sibling of the Odysseus repo:
+#   git clone https://github.com/searxng/searxng.git /path/to/perProjects/searxng
+#   cd /path/to/perProjects/searxng && make install
+# Default port: 8888 (as set in searx/settings.yml by make install).
+SEARXNG_PID=""
+SEARXNG_DIR="$(dirname "$INSTALL_DIR")/searxng"
+SEARXNG_VENV_PYTHON="$SEARXNG_DIR/venv/bin/python"
+SEARXNG_SETTINGS="$SEARXNG_DIR/searx/settings.yml"
+SEARXNG_LOG="$INSTALL_DIR/logs/searxng-app.log"
+if [ -f "$SEARXNG_SETTINGS" ] && [ -x "$SEARXNG_VENV_PYTHON" ]; then
+  export SEARXNG_INSTANCE="http://127.0.0.1:8888"
+  # Must cd into searxng dir so Python finds the searx package from source.
+  # Use a pidfile to capture PID across the subshell boundary.
+  _SEARXNG_PIDFILE="$(mktemp)"
+  (cd "$SEARXNG_DIR" && SEARXNG_SETTINGS_PATH="$SEARXNG_SETTINGS" \
+    nohup "$SEARXNG_VENV_PYTHON" -m searx.webapp >"$SEARXNG_LOG" 2>&1 & echo $! >"$_SEARXNG_PIDFILE")
+  SEARXNG_PID="$(cat "$_SEARXNG_PIDFILE" 2>/dev/null)"
+  rm -f "$_SEARXNG_PIDFILE"
+fi
+
 if [ "$(uname -m)" = "arm64" ]; then
   arch -arm64 "$UVICORN" app:app --host 127.0.0.1 --port "$PORT" >>"$LOG" 2>&1 &
 else
@@ -126,8 +210,8 @@ else
 fi
 SERVER_PID=$!
 
-# Quitting the app stops the server it started.
-trap 'kill $SERVER_PID 2>/dev/null; exit 0' TERM INT
+# Quitting the app stops the server and SearXNG.
+trap 'kill $SERVER_PID 2>/dev/null; [ -n "$SEARXNG_PID" ] && kill "$SEARXNG_PID" 2>/dev/null; exit 0' TERM INT
 
 # Wait for readiness (first run downloads an embedding model — allow ~2 min).
 READY=0
