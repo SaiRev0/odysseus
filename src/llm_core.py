@@ -2776,20 +2776,10 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                                                             # Strip the opening <think[...] > from the first chunk.
                                                             # Use a dedicated flag — _first_content_sent stays False
                                                             # throughout the think block, so it must not be reused.
-                                                            tag_end = (
-                                                                think_part.lower().find(
-                                                                    ">"
-                                                                )
-                                                                if tag_end != -1:
-                                                                    think_part = (
-                                                                        think_part[
-                                                                            tag_end
-                                                                            + 1 :
-                                                                        ]
-                                                                    )
-                                                                _think_open_stripped = (
-                                                                    True
-                                                                )
+                                                            tag_end = think_part.lower().find(">")
+                                                            if tag_end != -1:
+                                                                think_part = think_part[tag_end + 1:]
+                                                            _think_open_stripped = True
                                                             regular_part = content[
                                                                 close_idx
                                                                 + len("</think>") :
@@ -2917,9 +2907,9 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                                             _harmony_router.feed(data)
                                         ):
                                             yield event
-                        except Exception as e:
-                            logger.error(f"Error parsing stream data: {e}")
-                            continue
+                    except Exception as e:
+                        logger.error(f"Error parsing stream data: {e}")
+                        continue
 
                 # End of stream (no explicit [DONE] received)
                 for event in _format_routed_content(_harmony_router.flush()):
