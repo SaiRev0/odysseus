@@ -24076,7 +24076,7 @@ a.chat-link[href^="#research-"] {
   align-items: center;
 }
 /* When expanded, height grows to fit the detail panel. */
-.task-card.expanded { align-items: flex-start; }
+.task-card.expanded { align-items: flex-start; max-height: none; }
 /* Nudge the card text up (dot/menu keep their own offsets); the leading icon
    and built-in tag ride a bit higher to sit on the title's cap line. */
 .task-card .memory-item-title,

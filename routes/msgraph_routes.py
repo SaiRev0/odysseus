@@ -99,7 +99,19 @@ def setup_msgraph_routes() -> APIRouter:
             # Surface the stored display name if we have it
             result["display_name"] = settings.get("msgraph_display_name", "")
             result["upn"] = settings.get("msgraph_upn", "")
+        result["enable_polling"] = settings.get("msgraph_enable_polling", False)
         return result
+
+    @router.post("/api/msgraph/settings")
+    async def update_settings(request: Request):
+        """Update Microsoft Graph settings."""
+        require_admin(request)
+        data = await request.json()
+        settings = load_settings()
+        if "msgraph_enable_polling" in data:
+            settings["msgraph_enable_polling"] = bool(data["msgraph_enable_polling"])
+        save_settings(settings)
+        return {"success": True}
 
     @router.post("/api/msgraph/connect/start")
     async def connect_start(request: Request):

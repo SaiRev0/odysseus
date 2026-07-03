@@ -422,6 +422,7 @@ const _TASK_ICONS = {
   // Email
   summarize_emails:    '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/>',
   draft_email_replies: '<polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/>',
+  conditional_auto_reply: '<path d="M20 6 9 17l-5-5"/><rect x="2" y="4" width="20" height="16" rx="2"/>',
   email_auto_translate:'<path d="M5 8h9"/><path d="M9 4v4"/><path d="M4 13c2.2-.2 4.2-1.1 5.5-2.8"/><path d="M10.5 13c-1.1-.6-2-1.5-2.7-2.8"/><path d="M14 20l4-9 4 9"/><path d="M15.4 17h5.2"/>',
   extract_email_events:'<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M7 14h5"/><path d="M7 18h8"/>',
   classify_events:    '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M8 15h.01M12 15h.01M16 15h.01"/>',
@@ -450,6 +451,7 @@ function _taskIcon(task) {
 const _MODEL_BACKED_ACTIONS = new Set([
   'summarize_emails',
   'draft_email_replies',
+  'conditional_auto_reply',
   'email_auto_translate',
   'extract_email_events',
   'classify_events',
@@ -595,6 +597,7 @@ const _CATEGORY_MAP = {
   extract_email_events: 'Calendar',
   summarize_emails:           'Email',
   draft_email_replies:        'Email',
+  conditional_auto_reply:     'Email',
   email_auto_translate:       'Email',
   learn_sender_signatures:    'Email',
   check_email_urgency:        'Email',
@@ -908,6 +911,10 @@ function _renderList() {
       }
       detail.appendChild(desc);
     }
+    if (task.action === 'conditional_auto_reply') {
+      _renderAutoReplyRuleBuilder(detail);
+    }
+    
     detail.appendChild(detailActions);
     content.appendChild(detail);
 
@@ -2931,6 +2938,286 @@ async function _pollTaskNotifications() {
     // Silently ignore — server may be unreachable
   }
 }
+
+
+let _autoReplyRules = [];
+async function _fetchAutoReplyRules() {
+  try {
+    const res = await fetch(`${API_BASE}/api/email/auto-reply-rules`);
+    if (res.ok) {
+      const data = await res.json();
+      _autoReplyRules = data.rules || [];
+    }
+  } catch (e) {
+    console.error("Failed to fetch auto reply rules", e);
+  }
+}
+
+async function _saveAutoReplyRule(ruleId, ruleData) {
+  const method = ruleId ? 'PUT' : 'POST';
+  const url = ruleId ? `${API_BASE}/api/email/auto-reply-rules/${ruleId}` : `${API_BASE}/api/email/auto-reply-rules`;
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(ruleData)
+    });
+    if (!res.ok) throw new Error("Failed to save rule");
+    await _fetchAutoReplyRules();
+  } catch (e) {
+    if (uiModule) uiModule.showError("Failed to save rule: " + e.message);
+  }
+}
+
+async function _deleteAutoReplyRule(ruleId) {
+  if (!confirm("Delete this rule?")) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/email/auto-reply-rules/${ruleId}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error("Failed to delete rule");
+    await _fetchAutoReplyRules();
+  } catch (e) {
+    if (uiModule) uiModule.showError("Failed to delete rule: " + e.message);
+  }
+}
+
+function _renderAutoReplyRuleBuilder(container) {
+  // We attach a container that we will rebuild upon fetch
+  const ruleBox = document.createElement('div');
+  ruleBox.style.cssText = 'margin-top: 12px; border-top: 1px solid var(--border); padding-top: 12px;';
+  container.appendChild(ruleBox);
+
+  const renderContent = () => {
+    ruleBox.innerHTML = '';
+    
+    const hdr = document.createElement('div');
+    hdr.style.cssText = 'font-weight:600; margin-bottom: 8px; display:flex; justify-content:space-between; align-items:center;';
+    hdr.innerHTML = `<span>Auto-Reply Rules</span>`;
+    
+    const addBtn = document.createElement('button');
+    addBtn.className = 'btn';
+    addBtn.style.cssText = 'padding: 4px 8px; font-size: 11px;';
+    addBtn.textContent = '+ Add Rule';
+    addBtn.onclick = (e) => {
+      e.stopPropagation();
+      _showRuleForm(ruleBox, null, renderContent);
+    };
+    hdr.appendChild(addBtn);
+    ruleBox.appendChild(hdr);
+
+    if (_autoReplyRules.length === 0) {
+      const empty = document.createElement('div');
+      empty.style.cssText = 'opacity:0.6; font-size:12px; padding: 12px 0; text-align:center;';
+      empty.textContent = 'No rules configured. Emails will not receive auto-replies.';
+      ruleBox.appendChild(empty);
+    } else {
+      for (const r of _autoReplyRules) {
+        const row = document.createElement('div');
+        row.style.cssText = `margin-bottom:8px; padding:8px; border:1px solid var(--border); border-radius:4px; background:var(--bg-card); ${r.enabled ? '' : 'opacity:0.6;'}`;
+        
+        const top = document.createElement('div');
+        top.style.cssText = 'display:flex; justify-content:space-between; align-items:center; margin-bottom: 6px;';
+        
+        const nm = document.createElement('div');
+        nm.style.cssText = 'font-weight:600; font-size:12px;';
+        nm.textContent = r.name || 'Unnamed Rule';
+        top.appendChild(nm);
+        
+        const acts = document.createElement('div');
+        acts.style.cssText = 'display:flex; gap:8px; align-items:center;';
+        
+        const tog = document.createElement('input');
+        tog.type = 'checkbox';
+        tog.checked = r.enabled;
+        tog.title = 'Enable/Disable';
+        tog.onclick = async (e) => {
+          e.stopPropagation();
+          await _saveAutoReplyRule(r.id, { enabled: tog.checked });
+          renderContent();
+        };
+        acts.appendChild(tog);
+        
+        const eb = document.createElement('button');
+        eb.className = 'memory-toolbar-btn';
+        eb.textContent = 'Edit';
+        eb.onclick = (e) => { e.stopPropagation(); _showRuleForm(ruleBox, r, renderContent); };
+        acts.appendChild(eb);
+        
+        const db = document.createElement('button');
+        db.className = 'memory-toolbar-btn';
+        db.style.color = 'var(--red)';
+        db.textContent = 'Delete';
+        db.onclick = async (e) => { e.stopPropagation(); await _deleteAutoReplyRule(r.id); renderContent(); };
+        acts.appendChild(db);
+        
+        top.appendChild(acts);
+        row.appendChild(top);
+        
+        const meta = document.createElement('div');
+        meta.style.cssText = 'font-size:11px; opacity:0.8; display:flex; flex-direction:column; gap:4px;';
+        
+        let matchText = `Match: [${r.match_mode.toUpperCase()}] `;
+        if (r.match_mode === 'regex') {
+          matchText += `Keywords: ${(r.keywords || []).join(', ')}`;
+        } else {
+          matchText += `Prompt: "${r.match_prompt || ''}"`;
+        }
+        if (r.only_from && r.only_from.length) {
+          matchText += ` | From: ${r.only_from.join(', ')}`;
+        }
+        
+        let replyText = `Reply: [${r.reply_mode.toUpperCase()}] `;
+        if (r.reply_mode === 'static') {
+          replyText += `Static template`;
+        } else {
+          replyText += `LLM generated`;
+        }
+        
+        const m1 = document.createElement('div'); m1.textContent = matchText; meta.appendChild(m1);
+        const m2 = document.createElement('div'); m2.textContent = replyText; meta.appendChild(m2);
+        
+        row.appendChild(meta);
+        ruleBox.appendChild(row);
+      }
+    }
+  };
+
+  // Fetch and render initially
+  _fetchAutoReplyRules().then(renderContent);
+}
+
+function _showRuleForm(container, rule, onDone) {
+  const isNew = !rule;
+  const formBox = document.createElement('div');
+  formBox.style.cssText = 'margin-top:8px; padding:12px; border:1px solid var(--border); border-radius:4px; background:var(--bg-card);';
+  
+  formBox.innerHTML = `
+    <div style="font-weight:600; font-size:12px; margin-bottom:12px;">${isNew ? 'Create' : 'Edit'} Rule</div>
+    
+    <div style="margin-bottom:8px;">
+      <label style="display:block; font-size:11px; margin-bottom:4px; opacity:0.8;">Rule Name</label>
+      <input type="text" class="task-form-input" id="ar-name" value="${_esc(rule?.name || 'New Rule')}">
+    </div>
+    
+    <div style="margin-bottom:8px;">
+      <label style="display:block; font-size:11px; margin-bottom:4px; opacity:0.8;">Only from (Optional comma-separated emails)</label>
+      <input type="text" class="task-form-input" id="ar-only-from" value="${_esc((rule?.only_from || []).join(', '))} " placeholder="e.g. boss@acme.com, alerts@sys.com">
+    </div>
+
+    <div style="margin: 16px 0; border-top: 1px dashed var(--border); padding-top: 12px;">
+      <div style="font-weight:600; font-size:11px; margin-bottom:8px; display:flex; align-items:center; justify-content:space-between;">
+        <span>MATCHING STRATEGY</span>
+        <select class="task-form-input" id="ar-match-mode" style="width: auto; font-size:11px; padding:2px 6px;">
+          <option value="regex" ${(rule?.match_mode !== 'llm') ? 'selected' : ''}>Regex / Keyword</option>
+          <option value="llm" ${(rule?.match_mode === 'llm') ? 'selected' : ''}>AI (LLM)</option>
+        </select>
+      </div>
+      
+      <div id="ar-match-regex-box">
+        <div style="margin-bottom:8px;">
+          <label style="display:block; font-size:11px; margin-bottom:4px; opacity:0.8;">Keywords (comma-separated, regex supported)</label>
+          <input type="text" class="task-form-input" id="ar-keywords" value="${_esc((rule?.keywords || []).join(', '))} ">
+        </div>
+        <div style="margin-bottom:8px; font-size:11px;">
+          <label><input type="checkbox" id="ar-subj-only" ${rule?.match_subject_only ? 'checked' : ''}> Search subject only</label>
+        </div>
+      </div>
+      
+      <div id="ar-match-llm-box" style="display:none;">
+        <div style="margin-bottom:8px;">
+          <label style="display:block; font-size:11px; margin-bottom:4px; opacity:0.8;">LLM Question (Must be answerable with YES or NO)</label>
+          <textarea class="task-form-input" id="ar-match-prompt" rows="2" placeholder="Does this email ask for budget approval?">${_esc(rule?.match_prompt || '')}</textarea>
+        </div>
+      </div>
+    </div>
+
+    <div style="margin: 16px 0; border-top: 1px dashed var(--border); padding-top: 12px;">
+      <div style="font-weight:600; font-size:11px; margin-bottom:8px; display:flex; align-items:center; justify-content:space-between;">
+        <span>REPLY STRATEGY</span>
+        <select class="task-form-input" id="ar-reply-mode" style="width: auto; font-size:11px; padding:2px 6px;">
+          <option value="static" ${(rule?.reply_mode !== 'llm') ? 'selected' : ''}>Static Template</option>
+          <option value="llm" ${(rule?.reply_mode === 'llm') ? 'selected' : ''}>AI (LLM)</option>
+        </select>
+      </div>
+
+      <div style="margin-bottom:8px;">
+        <label style="display:block; font-size:11px; margin-bottom:4px; opacity:0.8;">Subject Prefix</label>
+        <input type="text" class="task-form-input" id="ar-prefix" value="${_esc(rule?.reply_subject_prefix || 'Re: ')}">
+      </div>
+      
+      <div id="ar-reply-static-box">
+        <div style="margin-bottom:8px;">
+          <label style="display:block; font-size:11px; margin-bottom:4px; opacity:0.8;">Static Template (supports {sender_name}, {subject})</label>
+          <textarea class="task-form-input" id="ar-static-template" rows="4">${_esc(rule?.reply_template || '')}</textarea>
+        </div>
+      </div>
+      
+      <div id="ar-reply-llm-box" style="display:none;">
+        <div style="margin-bottom:8px;">
+          <label style="display:block; font-size:11px; margin-bottom:4px; opacity:0.8;">LLM System Prompt</label>
+          <textarea class="task-form-input" id="ar-llm-prompt" rows="4" placeholder="You are Saiyam's assistant. Write a professional reply...">${_esc(rule?.llm_prompt || '')}</textarea>
+        </div>
+      </div>
+    </div>
+
+    <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:12px;">
+      <button class="btn btn-secondary" id="ar-cancel">Cancel</button>
+      <button class="btn" id="ar-save">Save Rule</button>
+    </div>
+  `;
+  
+  // Replace container contents with the form
+  container.innerHTML = '';
+  container.appendChild(formBox);
+
+  // Toggle visibility based on selects
+  const mm = document.getElementById('ar-match-mode');
+  const mmR = document.getElementById('ar-match-regex-box');
+  const mmL = document.getElementById('ar-match-llm-box');
+  mm.addEventListener('change', () => {
+    mmR.style.display = mm.value === 'regex' ? 'block' : 'none';
+    mmL.style.display = mm.value === 'llm' ? 'block' : 'none';
+  });
+  mm.dispatchEvent(new Event('change'));
+
+  const rm = document.getElementById('ar-reply-mode');
+  const rmS = document.getElementById('ar-reply-static-box');
+  const rmL = document.getElementById('ar-reply-llm-box');
+  rm.addEventListener('change', () => {
+    rmS.style.display = rm.value === 'static' ? 'block' : 'none';
+    rmL.style.display = rm.value === 'llm' ? 'block' : 'none';
+  });
+  rm.dispatchEvent(new Event('change'));
+
+  document.getElementById('ar-cancel').onclick = (e) => { e.stopPropagation(); onDone(); };
+  document.getElementById('ar-save').onclick = async (e) => {
+    e.stopPropagation();
+    const data = {
+      name: document.getElementById('ar-name').value,
+      enabled: rule ? rule.enabled : true,
+      only_from: document.getElementById('ar-only-from').value.split(',').map(s=>s.trim()).filter(Boolean),
+      match_mode: mm.value,
+      keywords: document.getElementById('ar-keywords').value.split(',').map(s=>s.trim()).filter(Boolean),
+      match_subject_only: document.getElementById('ar-subj-only').checked,
+      match_prompt: document.getElementById('ar-match-prompt').value,
+      reply_mode: rm.value,
+      reply_template: document.getElementById('ar-static-template').value,
+      llm_prompt: document.getElementById('ar-llm-prompt').value,
+      reply_subject_prefix: document.getElementById('ar-prefix').value
+    };
+    
+    // Basic validation
+    if (data.match_mode === 'regex' && !data.keywords.length) return alert('Keywords required for regex match');
+    if (data.match_mode === 'llm' && !data.match_prompt) return alert('Prompt required for LLM match');
+    if (data.reply_mode === 'static' && !data.reply_template) return alert('Template required for static reply');
+    if (data.reply_mode === 'llm' && !data.llm_prompt) return alert('Prompt required for LLM reply');
+
+    document.getElementById('ar-save').disabled = true;
+    document.getElementById('ar-save').textContent = 'Saving...';
+    await _saveAutoReplyRule(rule?.id, data);
+    onDone(); // Will re-fetch and render list
+  };
+}
+
 
 function startNotificationPolling() {
   if (_notifInterval) return;
