@@ -169,6 +169,8 @@ DEFAULT_SETTINGS = {
     # Max relevant skills injected into the prompt for one request. The skills
     # library can grow beyond this; cleanup/retirement is an explicit review flow.
     "skill_max_injected": 3,
+    # Built-in browser (Playwright MCP)
+    "browser_headless": True,  # True = headless (no visible window); False = headed
     # Reminders
     "reminder_channel": "browser",  # "browser" | "email" | "ntfy" | "webhook"
     "reminder_llm_synthesis": False,

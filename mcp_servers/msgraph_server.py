@@ -1,7 +1,7 @@
 """
 msgraph_server.py
 
-Built-in MCP server for Microsoft Graph — Outlook mail + Teams messages.
+Built-in MCP server for Microsoft Graph — Outlook mail + Teams messages + online meetings.
 
 Tools exposed:
   read_outlook_mail       — list recent Outlook messages (read-only)
@@ -10,6 +10,7 @@ Tools exposed:
   read_teams_chats        — list recent Teams chat messages (read-only)
   draft_teams_message     — compose a Teams message and stash it for user approval
   confirm_send_teams      — send a previously stashed Teams message (after user confirms)
+  create_teams_meeting    — create a Teams online meeting / call and return the join URL
   msgraph_status          — show whether Microsoft account is connected
 
 Token lifecycle:
@@ -31,7 +32,7 @@ import re
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -56,7 +57,7 @@ _TENANT_ID = os.environ.get("MSGRAPH_TENANT_ID", "common")
 _AUTHORITY = f"https://login.microsoftonline.com/{_TENANT_ID}"
 
 _MAIL_SCOPES = ["User.Read", "Mail.Read", "Mail.Send"]
-_TEAMS_SCOPES = ["User.Read", "Chat.Read", "ChatMessage.Send", "ChannelMessage.Send"]
+_TEAMS_SCOPES = ["User.Read", "Chat.Read", "ChatMessage.Send", "ChannelMessage.Send", "OnlineMeetings.ReadWrite"]
 # offline_access is a reserved MSAL scope — MSAL adds it automatically.
 # Do NOT include it here or acquire_token_by_refresh_token will raise ValueError.
 _ALL_SCOPES = list(dict.fromkeys(_MAIL_SCOPES + _TEAMS_SCOPES))
@@ -589,6 +590,54 @@ def _do_confirm_send_teams(pending_id: str) -> str:
     return f"✅ Teams message sent to **{recipient_name}**."
 
 
+def _do_create_teams_meeting(
+    subject: str,
+    start_minutes_from_now: int = 5,
+    duration_minutes: int = 30,
+) -> str:
+    """Create a Teams online meeting and return the join URL."""
+    now = datetime.now(timezone.utc)
+    start = now + timedelta(minutes=max(0, start_minutes_from_now))
+    end = start + timedelta(minutes=max(5, duration_minutes))
+
+    payload = {
+        "subject": subject,
+        "startDateTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "endDateTime": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+    resp = requests.post(
+        f"{_GRAPH_BASE}/me/onlineMeetings",
+        headers=_auth_headers(),
+        json=payload,
+        timeout=30,
+    )
+    if resp.status_code != 201:
+        raise RuntimeError(
+            f"Failed to create Teams meeting (HTTP {resp.status_code}): {resp.text[:300]}"
+        )
+
+    meeting = resp.json()
+    join_url = meeting.get("joinWebUrl", "")
+    meeting_id = meeting.get("id", "")
+    start_dt = meeting.get("startDateTime", start.isoformat())
+    end_dt = meeting.get("endDateTime", end.isoformat())
+
+    lines = [
+        "📞 **Teams meeting created successfully!**",
+        "",
+        f"**Subject   :** {subject}",
+        f"**Starts at :** {start_dt}",
+        f"**Ends at   :** {end_dt}",
+        f"**Meeting ID:** {meeting_id}",
+        "",
+        f"**Join URL  :** {join_url}",
+        "",
+        "Share the Join URL with participants to start the call.",
+    ]
+    return "\n".join(lines)
+
+
 # ── MCP Tool Registration ─────────────────────────────────────────────────────
 
 
@@ -754,6 +803,34 @@ async def list_tools() -> list[Tool]:
                 "required": ["pending_id"],
             },
         ),
+        Tool(
+            name="create_teams_meeting",
+            description=(
+                "Create a Microsoft Teams online meeting (call) and return the join URL. "
+                "Use this when the user asks to schedule a Teams call, start a meeting, "
+                "or create a video call link. The join URL can be shared with participants."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "subject": {
+                        "type": "string",
+                        "description": "Meeting subject / title",
+                    },
+                    "start_minutes_from_now": {
+                        "type": "integer",
+                        "description": "How many minutes from now the meeting starts (default 5)",
+                        "default": 5,
+                    },
+                    "duration_minutes": {
+                        "type": "integer",
+                        "description": "Duration of the meeting in minutes (default 30)",
+                        "default": 30,
+                    },
+                },
+                "required": ["subject"],
+            },
+        ),
     ]
 
 
@@ -799,6 +876,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "confirm_send_teams":
             text = _do_confirm_send_teams(arguments["pending_id"])
+
+        elif name == "create_teams_meeting":
+            text = _do_create_teams_meeting(
+                subject=arguments["subject"],
+                start_minutes_from_now=int(arguments.get("start_minutes_from_now", 5)),
+                duration_minutes=int(arguments.get("duration_minutes", 30)),
+            )
 
         else:
             text = f"Unknown tool: {name}"

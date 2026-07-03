@@ -79,11 +79,63 @@ _BUILTIN_SERVERS = {
 }
 
 # NPX-based built-in servers (run via npx, not Python)
+#
+# Browser configuration: uses Microsoft Edge with a dedicated Odysseus-managed
+# profile directory so sessions and logins persist across agent runs without
+# conflicting with the user's live Edge window (which locks its own profile dir).
+#
+# Profile location: ~/Library/Application Support/OdysseusEdge  (macOS default)
+# Override via env var ODYSSEUS_BROWSER_PROFILE to point at a different path.
+#
+# Headless mode is controlled via Settings → Integrations → Built-in: Browser
+# (stored as settings key "browser_headless", default True).
+# Env var ODYSSEUS_BROWSER_HEADLESS=0 overrides the setting for scripted runs.
+#
+# The live Edge profile (~/.../Microsoft Edge) is intentionally NOT used here —
+# Playwright cannot open it while Edge is already running (profile lock conflict).
+_EDGE_PROFILE_DIR = os.environ.get(
+    "ODYSSEUS_BROWSER_PROFILE",
+    os.path.expanduser("~/Library/Application Support/OdysseusEdge"),
+)
+
+
+def _build_browser_args() -> list:
+    """Build the @playwright/mcp arg list, reading headless preference from
+    settings at call time so a settings change takes effect on the next
+    server (re)connect without requiring an app restart."""
+    # Env var takes priority over settings (useful for scripted/CI runs).
+    env_override = os.environ.get("ODYSSEUS_BROWSER_HEADLESS", "").strip()
+    if env_override:
+        headless = env_override not in ("0", "false", "no")
+    else:
+        try:
+            from src.settings import get_setting
+
+            headless = bool(get_setting("browser_headless", True))
+        except Exception:
+            headless = True
+
+    args = [
+        "-y",
+        "@playwright/mcp@latest",
+        "--browser",
+        "msedge",
+        "--user-data-dir",
+        _EDGE_PROFILE_DIR,
+        "--caps",
+        "vision",
+    ]
+    if headless:
+        args.insert(2, "--headless")
+    return args
+
+
 _BUILTIN_NPX_SERVERS = {
     "builtin_browser": {
-        "name": "Built-in: Browser",
+        "name": "Built-in: Browser (Edge)",
         "command": "npx",
-        "args": ["-y", "@playwright/mcp@latest", "--headless", "--caps", "vision"],
+        # args is a callable so each (re)connect reads the latest setting.
+        "args_factory": _build_browser_args,
     }
 }
 
@@ -164,7 +216,9 @@ async def register_builtin_servers(mcp_manager):
             # task, which cascades cancellations into the rest of the event
             # loop and downs the app. Detecting installed-state up-front lets
             # us bail with a useful warning before we ever touch stdio_client.
-            args = cfg["args"]
+            # Support args_factory (callable) so settings read at connect time.
+            args_factory = cfg.get("args_factory")
+            args = args_factory() if callable(args_factory) else cfg.get("args", [])
             pkg_spec = _npx_package_from_args(args)
             if pkg_spec and not await _is_npx_package_cached(npx_path, pkg_spec):
                 logger.warning(

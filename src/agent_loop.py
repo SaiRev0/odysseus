@@ -114,6 +114,7 @@ _AGENT_RULES = """\
 - Only use tools when needed. Don't search for things you already know.
 - For web lookup/search/latest/current requests, use `web_search` or `web_fetch`. Do NOT use `bash`, `python`, `curl`, `requests`, or scraping code for web lookup unless web tools are disabled or already failed.
 - If `web_search` is listed in this prompt, web search is available. Do NOT tell the user search/web tools are unavailable.
+- For tasks that require INTERACTING with a website — clicking buttons, filling forms, marking attendance, submitting approvals, logging in to a portal, navigating pages, taking screenshots — use the `builtin_browser` MCP tool (mcp__playwright__ prefixed tools). Do NOT say "I can't do that" or ask the user to do it manually. Just use the browser tool and do it. The browser has your saved sessions and SSO — go ahead and act.
 - These exact tags execute automatically. For showing code examples, use ```shell, ```sh, ```py, etc. instead.
 - Multiple tool blocks per response OK. 60s timeout per tool, 10K char output limit.
 - Code/content >15 lines → ```create_document (NOT in chat). Short snippets OK in chat.
@@ -163,6 +164,7 @@ _API_AGENT_RULES = """\
 - You MUST use tools to take action — do not describe what you would do. Act, don't narrate.
 - For web lookup/search/latest/current requests, call `web_search` or `web_fetch`. Do NOT use shell, Python, curl, requests, or scraping code for web lookup unless web tools are unavailable or already failed.
 - If `web_search` is listed in this prompt, web search is available. Do NOT tell the user search/web tools are unavailable.
+- For tasks that require INTERACTING with a website — clicking buttons, filling forms, marking attendance, submitting approvals, logging in to a portal, navigating pages, taking screenshots — use the `builtin_browser` MCP tool (mcp__playwright__ prefixed tools). Do NOT say "I can't do that" or ask the user to do it manually. Just use the browser tool and do it. The browser has your saved sessions and SSO — go ahead and act.
 - Keep answers concise unless the user asks for depth.
 - For long code or content, use document tools instead of pasting large blocks into chat.
 - Long-form or structured writing is a document by default when the user asks to write/create/make/generate it and the answer would be more than a short paragraph. Call create_document instead of dumping the full content in chat.
@@ -354,6 +356,7 @@ _DOMAIN_TOOL_MAP = {
         "mcp__msgraph__read_teams_chats",
         "mcp__msgraph__draft_teams_message",
         "mcp__msgraph__confirm_send_teams",
+        "mcp__msgraph__create_teams_meeting",
         "mcp__msgraph__resolve_msgraph_contact",
         "mcp__msgraph__msgraph_status",
     },
@@ -598,6 +601,7 @@ Args (JSON): {"recipient_name": "...", "message": "...", "chat_id": "..."}.""",
 MANDATORY: Call this when the user says 'send' or 'confirm'.
 CRITICAL: The pending_id is in the previous assistant message that showed the draft (look for the line `_(pending_id: XXXX)_`). Extract it from the conversation history — the user does NOT repeat it. Never say you don't have the pending_id; always scan back and use it.
 Args (JSON): {"pending_id": "..."}.""",
+    "mcp__msgraph__create_teams_meeting": '- ```mcp__msgraph__create_teams_meeting``` — Create a Microsoft Teams online meeting / call and return the join URL. Use when the user asks to schedule a call, start a meeting, or create a Teams video link. Args (JSON): {"subject": "...", "start_minutes_from_now": 5, "duration_minutes": 30}.',
     "mcp__msgraph__resolve_msgraph_contact": '- ```mcp__msgraph__resolve_msgraph_contact``` — Look up a person\'s email via Microsoft AAD + Outlook contacts. Args (JSON): {"name": "..."}.',
     "manage_contact": '- ```manage_contact``` — Create/update/delete/list CardDAV contacts. Args (JSON): {"action": "list|add|update|delete", "name": "...", "email": "...", "phones": [...], "address": "...", "uid": "..."}. Use for info about another person: email, phone, postal address. For \'save this for <person>\' / address paste / phone next to a name, use this — NOT manage_memory. Do NOT use for user identity facts (\'my name is X\'); those are manage_memory. For update/delete, call action=list first for the uid.',
     "manage_calendar": """\
@@ -811,6 +815,17 @@ _MCP_KEYWORDS = frozenset(
         "miniflux",
         "rss",
         "feed",
+        "attendance",
+        "login",
+        "portal",
+        "form",
+        "submit",
+        "fill",
+        "hrms",
+        "approve",
+        "approval",
+        "checkbox",
+        "button",
     ]
 )
 _ADMIN_SCHEMA_NAMES = frozenset(
@@ -1004,7 +1019,9 @@ def _insert_before_latest_user(messages: List[Dict], context_msg: Dict) -> List[
     return out
 
 
-def _uploaded_files_context_message(uploaded_files: Optional[List[Dict]]) -> Optional[Dict]:
+def _uploaded_files_context_message(
+    uploaded_files: Optional[List[Dict]],
+) -> Optional[Dict]:
     if not uploaded_files:
         return None
 
@@ -1025,11 +1042,15 @@ def _uploaded_files_context_message(uploaded_files: Optional[List[Dict]]) -> Opt
             bits.append(f"path={item.get('path')}")
         lines.append("- " + "; ".join(bits))
     if len(uploaded_files) > 20:
-        lines.append(f"- ... {len(uploaded_files) - 20} more upload(s) omitted from this manifest")
-    lines.extend([
-        "",
-        "The attachment contents may already be in the latest user message. If an attachment is marked truncated or omitted, read its listed path with `read_file` when that tool is available. Do not say uploaded files are undiscoverable when they are listed here.",
-    ])
+        lines.append(
+            f"- ... {len(uploaded_files) - 20} more upload(s) omitted from this manifest"
+        )
+    lines.extend(
+        [
+            "",
+            "The attachment contents may already be in the latest user message. If an attachment is marked truncated or omitted, read its listed path with `read_file` when that tool is available. Do not say uploaded files are undiscoverable when they are listed here.",
+        ]
+    )
     return untrusted_context_message("current chat uploaded files", "\n".join(lines))
 
 
@@ -3319,6 +3340,7 @@ async def stream_agent_loop(
     if not guide_only and uploaded_files:
         if _relevant_tools is None:
             from src.tool_index import ALWAYS_AVAILABLE
+
             _relevant_tools = set(ALWAYS_AVAILABLE)
         _relevant_tools.update({"read_file", "grep", "ls", "manage_documents"})
 
@@ -3810,11 +3832,29 @@ async def stream_agent_loop(
                     for s in FUNCTION_TOOL_SCHEMAS
                     if s.get("function", {}).get("name") in _schema_names
                 ]
-                _mcp_filtered = [
-                    s
-                    for s in mcp_schemas
-                    if s.get("function", {}).get("name") in _relevant_tools
-                ]
+                # MCP tools (e.g. builtin_browser) are dynamically registered
+                # and won't appear in the RAG-selected _relevant_tools set.
+                # Always include all MCP schemas when the user message contains
+                # MCP-trigger keywords (browser actions, form fills, etc.) so
+                # the agent actually gets the Playwright function schemas.
+                _last_msg_lower = messages[-1].get("content", "") if messages else ""
+                if isinstance(_last_msg_lower, list):
+                    _last_msg_lower = " ".join(
+                        p.get("text", "")
+                        for p in _last_msg_lower
+                        if isinstance(p, dict)
+                    )
+                _last_msg_lower = _last_msg_lower.lower()
+                _wants_browser = any(kw in _last_msg_lower for kw in _MCP_KEYWORDS)
+                _mcp_filtered = (
+                    mcp_schemas
+                    if _wants_browser
+                    else [
+                        s
+                        for s in mcp_schemas
+                        if s.get("function", {}).get("name") in _relevant_tools
+                    ]
+                )
                 all_tool_schemas = base_schemas + _mcp_filtered
             else:
                 base_schemas = (
@@ -5094,9 +5134,16 @@ async def stream_agent_loop(
         # tool_blocks but stayed in native_tool_calls, so indexing results by
         # native position mis-attached each result to the wrong tool_call_id
         # (and left the real call answered empty).
-        _append_tool_results(messages, round_response, converted_calls,
-                             tool_results, tool_result_texts, used_native, round_num,
-                             round_reasoning=round_reasoning)
+        _append_tool_results(
+            messages,
+            round_response,
+            converted_calls,
+            tool_results,
+            tool_result_texts,
+            used_native,
+            round_num,
+            round_reasoning=round_reasoning,
+        )
 
         # Emit agent_step event
         yield (
