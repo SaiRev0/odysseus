@@ -57,6 +57,7 @@ _SCOPES = [
     "Chat.Read",
     "ChatMessage.Send",
     "ChannelMessage.Send",
+    "OnlineMeetings.ReadWrite",
     # Note: offline_access is a reserved MSAL scope — do NOT include it here.
     # MSAL adds it automatically when using ConfidentialClientApplication.
 ]

@@ -5089,6 +5089,14 @@ async function initUnifiedIntegrations() {
         const statusColor = srv.needs_oauth ? '#e5a33a' : srv.status === 'connected' ? 'var(--green,#50fa7b)' : srv.status === 'error' ? 'var(--red)' : 'var(--fg)';
         const toolInfo = srv.status === 'connected' ? `${srv.enabled_tool_count}/${srv.tool_count} tools` : '';
         const statusText = srv.needs_oauth ? 'Needs authorization' : srv.status === 'connected' ? `Connected (${toolInfo})` : srv.status === 'error' ? `Error: ${esc(srv.error || 'unknown')}` : 'Disconnected';
+        // Fetch browser_headless setting for the builtin_browser toggle
+        let _browserHeadless = true;
+        if (srv.id === 'builtin_browser') {
+          try {
+            const sr = await fetch('/api/auth/settings', { credentials: 'same-origin' });
+            if (sr.ok) { const sd = await sr.json(); _browserHeadless = sd.browser_headless !== false; }
+          } catch (_) {}
+        }
         formEl.innerHTML = `
           <div class="admin-card" style="margin-top:8px">
             <h2 style="font-size:13px">${esc(srv.name)}</h2>
@@ -5096,15 +5104,45 @@ async function initUnifiedIntegrations() {
               <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${statusColor}"></span>
               <span style="font-size:11px;opacity:0.7">${statusText}</span>
             </div>
+            ${srv.id === 'builtin_browser' ? `
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;padding:8px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border)">
+              <span style="font-size:12px;flex:1">Browser mode</span>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
+                <input type="radio" name="uf-browser-mode" id="uf-browser-headless" value="headless" ${_browserHeadless ? 'checked' : ''}>
+                <span>Headless <span style="opacity:0.5;font-size:10px">(background, no window)</span></span>
+              </label>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
+                <input type="radio" name="uf-browser-mode" id="uf-browser-headed" value="headed" ${!_browserHeadless ? 'checked' : ''}>
+                <span>Headed <span style="opacity:0.5;font-size:10px">(visible window, for MFA/login)</span></span>
+              </label>
+            </div>` : ''}
             <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:8px;justify-content:flex-end;">
               <span id="uf-mcp-msg" style="font-size:11px;flex:1;margin-right:8px"></span>
               ${srv.needs_oauth ? `<a href="/api/mcp/oauth/authorize/${srv.id}" target="_blank" class="admin-btn-add" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));text-decoration:none;font-weight:600;">Authorize</a>` : ''}
               <button class="admin-btn-add" id="uf-mcp-reconnect" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Reconnect</button>
-              <button class="admin-btn-add" id="uf-mcp-toggle" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">${srv.is_enabled ? 'Disable' : 'Enable'}</button>
+              ${!srv.is_builtin ? `<button class="admin-btn-add" id="uf-mcp-toggle" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">${srv.is_enabled ? 'Disable' : 'Enable'}</button>` : ''}
               <button class="admin-btn-add" id="uf-mcp-cancel" style="background:transparent;color:var(--accent, var(--red));border-color:color-mix(in srgb, var(--accent, var(--red)) 45%, var(--border));">Close</button>
             </div>
             <div id="uf-mcp-tools-panel"></div>
           </div>`;
+        // Browser mode toggle — save setting + reconnect when changed
+        if (srv.id === 'builtin_browser') {
+          const modeRadios = formEl.querySelectorAll('input[name="uf-browser-mode"]');
+          modeRadios.forEach(radio => radio.addEventListener('change', async () => {
+            const headless = radio.value === 'headless';
+            const msg = el('uf-mcp-msg'); if (msg) msg.textContent = 'Saving…';
+            try {
+              await fetch('/api/auth/settings', {
+                method: 'POST', credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ browser_headless: headless })
+              });
+              if (msg) msg.textContent = 'Saved — reconnecting browser…';
+              await fetch(`/api/mcp/servers/${srv.id}/reconnect`, { method: 'POST', credentials: 'same-origin' });
+              if (msg) msg.textContent = headless ? 'Headless mode active' : 'Headed mode active — Edge window will open on next use';
+            } catch (_) { if (msg) msg.textContent = 'Failed to save'; }
+          }));
+        }
         // Reconnect
         el('uf-mcp-reconnect').addEventListener('click', async () => {
           const msg = el('uf-mcp-msg'); msg.textContent = 'Reconnecting...';
@@ -5116,13 +5154,16 @@ async function initUnifiedIntegrations() {
             showMcpForm(editId); // refresh this view
           } catch (e) { msg.textContent = 'Failed'; }
         });
-        // Toggle enable/disable
-        el('uf-mcp-toggle').addEventListener('click', async () => {
-          const fd = new FormData(); fd.append('is_enabled', String(!srv.is_enabled));
-          await fetch(`/api/mcp/servers/${srv.id}`, { method: 'PATCH', body: fd, credentials: 'same-origin' });
-          await renderList();
-          showMcpForm(editId);
-        });
+        // Toggle enable/disable (not shown for built-in servers)
+        const toggleBtn = el('uf-mcp-toggle');
+        if (toggleBtn) {
+          toggleBtn.addEventListener('click', async () => {
+            const fd = new FormData(); fd.append('is_enabled', String(!srv.is_enabled));
+            await fetch(`/api/mcp/servers/${srv.id}`, { method: 'PATCH', body: fd, credentials: 'same-origin' });
+            await renderList();
+            showMcpForm(editId);
+          });
+        }
         el('uf-mcp-cancel').addEventListener('click', () => { formEl.style.display = 'none'; });
         // Load tools list
         if (srv.status === 'connected' && srv.tool_count > 0) {
