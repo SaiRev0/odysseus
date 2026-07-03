@@ -571,6 +571,24 @@ async def action_draft_email_replies(owner: str, **kwargs) -> Tuple[str, bool]:
         return str(e), False
 
 
+async def action_conditional_auto_reply(owner: str, **kwargs) -> Tuple[str, bool]:
+    """Auto-send replies when emails match rules.
+    Match strategy: regex/keyword OR LLM classification (per-rule).
+    Reply strategy: static template OR LLM-generated (per-rule)."""
+    try:
+        from routes.email_pollers import _conditional_auto_reply_pass
+        result = await _conditional_auto_reply_pass(
+            owner, progress_cb=kwargs.get("progress_cb"))
+        if not _result_has_work(result):
+            raise TaskNoop(f"auto-reply: {result or 'no matches'}")
+        return result, True
+    except TaskNoop:
+        raise
+    except Exception as e:
+        logger.error(f"conditional_auto_reply failed: {e}")
+        return str(e), False
+
+
 async def action_email_auto_translate(owner: str, **kwargs) -> Tuple[str, bool]:
     """Detect recent foreign-language emails and cache translated text.
 
@@ -2738,6 +2756,7 @@ BUILTIN_ACTIONS = {
     "tidy_research": action_tidy_research,
     "summarize_emails": action_summarize_emails,
     "draft_email_replies": action_draft_email_replies,
+    "conditional_auto_reply": action_conditional_auto_reply,
     "email_auto_translate": action_email_auto_translate,
     "extract_email_events": action_extract_email_events,
     "classify_events": action_classify_events,
@@ -2763,6 +2782,7 @@ BUILTIN_ACTION_INFO = {
     "tidy_research": "Remove orphaned research files (sessions that were deleted)",
     "summarize_emails": "Pre-generate AI summaries for new inbox emails",
     "draft_email_replies": "Pre-draft AI reply suggestions for new inbox emails",
+    "conditional_auto_reply": "Auto-send replies when emails match rules. Match via keyword/regex or LLM classification. Reply with a static template or AI-generated response — configurable per rule.",
     "email_auto_translate": "Detect foreign-language emails and cache translated text for the email reader",
     "extract_email_events": "Scan emails for booking/meeting confirmations and auto-add to calendar",
     "classify_events": "Tag upcoming events with importance (low/normal/high/critical) and type (work/health/travel/etc.); colors them too",

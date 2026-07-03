@@ -20,3 +20,7 @@ markers = [
     # duration evidence (see tests/run_focus.py --durations and tests/README.md).
     "slow: opt-in marker for known-slow tests; excluded by the fast lane (not slow)",
 ]
+
+[tool.pyright]
+include = ["."]
+extraPaths = ["."]

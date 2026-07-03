@@ -4940,4 +4940,116 @@ def setup_email_routes():
             db.close()
         return _RR("/?section=integrations&email_oauth_success=1")
 
+    @router.get("/auto-reply-rules")
+    def get_auto_reply_rules(owner: str = Depends(require_user)):
+        settings = _load_settings()
+        # Return all rules for the owner (currently rules are global per install, 
+        # but we could scope them to owner if settings supported it. 
+        # For now, just return what's in settings.
+        return {"rules": settings.get("auto_reply_rules", [])}
+
+
+    @router.post("/auto-reply-rules")
+    async def create_auto_reply_rule(req: Request, owner: str = Depends(require_user)):
+        try:
+            body = await req.json()
+        except Exception:
+            raise HTTPException(400, "Invalid JSON")
+            
+        match_mode = body.get("match_mode", "regex")
+        reply_mode = body.get("reply_mode", "static")
+        
+        if match_mode not in ["regex", "llm"]:
+            raise HTTPException(400, "match_mode must be 'regex' or 'llm'")
+        if reply_mode not in ["static", "llm"]:
+            raise HTTPException(400, "reply_mode must be 'static' or 'llm'")
+        if match_mode == "regex" and not body.get("keywords"):
+            raise HTTPException(400, "keywords required for regex match_mode")
+        if match_mode == "llm" and not body.get("match_prompt"):
+            raise HTTPException(400, "match_prompt required for llm match_mode")
+        if reply_mode == "static" and not body.get("reply_template"):
+            raise HTTPException(400, "reply_template required for static reply_mode")
+        if reply_mode == "llm" and not body.get("llm_prompt"):
+            raise HTTPException(400, "llm_prompt required for llm reply_mode")
+            
+        import uuid
+        from datetime import datetime, timezone
+        rule = {
+            "id": f"rule_{uuid.uuid4().hex[:12]}",
+            "name": body.get("name", "New Rule"),
+            "enabled": bool(body.get("enabled", True)),
+            "match_mode": match_mode,
+            "keywords": body.get("keywords", []),
+            "match_subject_only": bool(body.get("match_subject_only", False)),
+            "match_prompt": body.get("match_prompt", ""),
+            "only_from": body.get("only_from", []),
+            "reply_mode": reply_mode,
+            "reply_template": body.get("reply_template", ""),
+            "llm_prompt": body.get("llm_prompt", ""),
+            "reply_subject_prefix": body.get("reply_subject_prefix", "Re: "),
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        settings = _load_settings()
+        rules = settings.get("auto_reply_rules", [])
+        rules.append(rule)
+        settings["auto_reply_rules"] = rules
+        _save_settings(settings)
+        return {"rule": rule}
+
+
+    @router.put("/auto-reply-rules/{rule_id}")
+    async def update_auto_reply_rule(rule_id: str, req: Request, owner: str = Depends(require_user)):
+        try:
+            body = await req.json()
+        except Exception:
+            raise HTTPException(400, "Invalid JSON")
+            
+        settings = _load_settings()
+        rules = settings.get("auto_reply_rules", [])
+        
+        rule_idx = -1
+        for i, r in enumerate(rules):
+            if r.get("id") == rule_id:
+                rule_idx = i
+                break
+                
+        if rule_idx == -1:
+            raise HTTPException(404, "Rule not found")
+            
+        rule = rules[rule_idx]
+        
+        if "name" in body: rule["name"] = body["name"]
+        if "enabled" in body: rule["enabled"] = bool(body["enabled"])
+        if "match_mode" in body: rule["match_mode"] = body["match_mode"]
+        if "keywords" in body: rule["keywords"] = body["keywords"]
+        if "match_subject_only" in body: rule["match_subject_only"] = bool(body["match_subject_only"])
+        if "match_prompt" in body: rule["match_prompt"] = body["match_prompt"]
+        if "only_from" in body: rule["only_from"] = body["only_from"]
+        if "reply_mode" in body: rule["reply_mode"] = body["reply_mode"]
+        if "reply_template" in body: rule["reply_template"] = body["reply_template"]
+        if "llm_prompt" in body: rule["llm_prompt"] = body["llm_prompt"]
+        if "reply_subject_prefix" in body: rule["reply_subject_prefix"] = body["reply_subject_prefix"]
+        
+        rules[rule_idx] = rule
+        settings["auto_reply_rules"] = rules
+        _save_settings(settings)
+        return {"rule": rule}
+
+
+    @router.delete("/auto-reply-rules/{rule_id}")
+    def delete_auto_reply_rule(rule_id: str, owner: str = Depends(require_user)):
+        settings = _load_settings()
+        rules = settings.get("auto_reply_rules", [])
+        
+        initial_len = len(rules)
+        rules = [r for r in rules if r.get("id") != rule_id]
+        
+        if len(rules) == initial_len:
+            raise HTTPException(404, "Rule not found")
+            
+        settings["auto_reply_rules"] = rules
+        _save_settings(settings)
+        return {"success": True}
+
     return router

@@ -5861,6 +5861,13 @@ async function _msGraphRefreshStatus() {
     const res = await fetch('/api/msgraph/status', { credentials: 'same-origin' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
+    
+    // Update the checkbox
+    const pollToggle = document.getElementById('msgraph_enable_polling');
+    if (pollToggle) {
+      pollToggle.checked = !!data.enable_polling;
+    }
+    
     if (data.connected) {
       badge.textContent = '✅ Connected';
       badge.style.background = 'color-mix(in srgb, #50fa7b 18%, transparent)';
@@ -5892,11 +5899,27 @@ async function _msGraphRefreshStatus() {
   function _wire() {
     const connectBtn = document.getElementById('msgraph-connect-btn');
     const disconnectBtn = document.getElementById('msgraph-disconnect-btn');
+    const pollToggle = document.getElementById('msgraph_enable_polling');
     const msgEl = document.getElementById('msgraph-msg');
     if (!connectBtn || connectBtn.dataset.wired) return;
     connectBtn.dataset.wired = '1';
 
     _msGraphRefreshStatus();
+    
+    if (pollToggle) {
+      pollToggle.addEventListener('change', async () => {
+        try {
+          await fetch('/api/msgraph/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ msgraph_enable_polling: pollToggle.checked }),
+            credentials: 'same-origin'
+          });
+        } catch (e) {
+          console.error("Failed to save MS Graph polling setting", e);
+        }
+      });
+    }
 
     connectBtn.addEventListener('click', async () => {
       if (msgEl) { msgEl.textContent = 'Starting OAuth…'; msgEl.style.color = ''; }
