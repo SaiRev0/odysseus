@@ -19,7 +19,13 @@ _TENANT_ID = os.environ.get("MSGRAPH_TENANT_ID", "common")
 _AUTHORITY = f"https://login.microsoftonline.com/{_TENANT_ID}"
 
 _MAIL_SCOPES = ["User.Read", "Mail.Read", "Mail.Send"]
-_TEAMS_SCOPES = ["User.Read", "Chat.Read", "ChatMessage.Send", "ChannelMessage.Send", "OnlineMeetings.ReadWrite"]
+_TEAMS_SCOPES = [
+    "User.Read",
+    "Chat.Read",
+    "ChatMessage.Send",
+    "ChannelMessage.Send",
+    "OnlineMeetings.ReadWrite",
+]
 _ALL_SCOPES = list(dict.fromkeys(_MAIL_SCOPES + _TEAMS_SCOPES))
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
@@ -28,6 +34,7 @@ _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 def _settings_path() -> Path:
     try:
         from src.constants import SETTINGS_FILE
+
         return Path(SETTINGS_FILE)
     except Exception:
         return Path(__file__).resolve().parent.parent / "data" / "settings.json"
@@ -44,6 +51,7 @@ def _load_refresh_token() -> Optional[str]:
         if not enc:
             return None
         from src.secret_storage import decrypt
+
         return decrypt(enc) or None
     except Exception as exc:
         logger.warning(f"msgraph: failed to load refresh token: {exc}")
@@ -78,7 +86,10 @@ def _get_access_token() -> Optional[str]:
     now = time.time()
 
     # Return cached token if still valid (with 60s buffer)
-    if _token_cache.get("access_token") and _token_cache.get("expires_at", 0) > now + 60:
+    if (
+        _token_cache.get("access_token")
+        and _token_cache.get("expires_at", 0) > now + 60
+    ):
         return _token_cache["access_token"]
 
     if not _CLIENT_ID or not _CLIENT_SECRET:

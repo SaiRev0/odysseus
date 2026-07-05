@@ -948,6 +948,31 @@ def _init_scheduled_db():
             PRIMARY KEY (message_id, owner, rule_id)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS teams_jira_approved (
+            teams_message_id TEXT NOT NULL,
+            jira_issue_key   TEXT NOT NULL,
+            owner            TEXT DEFAULT '',
+            approved_at      TEXT NOT NULL,
+            PRIMARY KEY (teams_message_id, jira_issue_key, owner)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS teams_jira_pending (
+            id               TEXT PRIMARY KEY,
+            owner            TEXT DEFAULT '',
+            teams_message_id TEXT NOT NULL,
+            chat_id          TEXT NOT NULL,
+            team_id          TEXT DEFAULT '',
+            channel_id       TEXT DEFAULT '',
+            source           TEXT DEFAULT 'chat',
+            sender_name      TEXT DEFAULT '',
+            jira_issue_key   TEXT NOT NULL,
+            jira_url         TEXT NOT NULL,
+            ticket_summary   TEXT DEFAULT '',
+            created_at       TEXT NOT NULL
+        )
+    """)
     # Lazy migration: normalise auto_reply_sent column names.
     # Early deploys used `replied_at NOT NULL`; the canonical name is `sent_at`.
     # Three cases to handle:
