@@ -18,6 +18,7 @@ Pure helpers live in `email_helpers.py`. Routes themselves live in
 
 import email as email_mod
 import email.utils  # the `email` binding is referenced as email.utils.parseaddr inside the pass
+import os
 import smtplib
 import json
 import re
@@ -214,6 +215,721 @@ async def _send_msgraph_reply(message_id: str, reply_body: str) -> None:
     import asyncio
 
     await asyncio.to_thread(_send_msgraph_reply_sync, message_id, reply_body)
+
+
+# ── Teams Jira Auto-Approval helpers ─────────────────────────────────────────
+
+_JIRA_URL_RE = re.compile(
+    r"(https?://[a-zA-Z0-9._-]+\.atlassian\.net/browse/([A-Z][A-Z0-9]+-\d+))"
+)
+
+
+def _extract_jira_links(text: str) -> list:
+    """Return list of (full_url, issue_key) tuples found in *text*."""
+    return _JIRA_URL_RE.findall(text or "")
+
+
+def _extract_jira_keys(text: str) -> list:
+    """Return all Jira issue keys (e.g. 'PROJ-123') found in *text*."""
+    return [key for _, key in _extract_jira_links(text)]
+
+
+def _load_jira_approval_comment() -> str:
+    """Return the approval comment text from settings (default: 'Approved')."""
+    try:
+        from routes.email_helpers import _load_settings as _ls
+
+        settings = _ls()
+        return settings.get("jira_approval_comment") or "Approved"
+    except Exception:
+        return "Approved"
+
+
+def _scrape_jira_ticket_sync(jira_url: str) -> dict:
+    """Open *jira_url* in the Odysseus browser profile and extract ticket metadata.
+
+    Returns a dict with keys:
+      title, status, assignee, description, raw_text
+    Returns empty strings on failure.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return {
+            "title": "",
+            "status": "",
+            "assignee": "",
+            "description": "",
+            "raw_text": "",
+        }
+
+    result = {
+        "title": "",
+        "status": "",
+        "assignee": "",
+        "description": "",
+        "raw_text": "",
+    }
+    profile_dir = _ODYSSEUS_BROWSER_PROFILE
+    os.makedirs(profile_dir, exist_ok=True)
+
+    try:
+        with sync_playwright() as pw:
+            ctx = pw.chromium.launch_persistent_context(
+                user_data_dir=profile_dir,
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = ctx.new_page()
+            page.goto(jira_url, wait_until="domcontentloaded", timeout=30_000)
+            page.wait_for_timeout(3_000)
+
+            if _is_login_page(page):
+                ctx.close()
+                return result
+
+            # Title
+            try:
+                result["title"] = page.locator("h1").first.inner_text().strip()
+            except Exception:
+                pass
+
+            # Status badge
+            try:
+                result["status"] = (
+                    page.locator(
+                        "[data-testid='issue.views.issue-base.foundation.status.status-field-wrapper'] button, "
+                        "[data-testid='issue-field-status'] button"
+                    )
+                    .first.inner_text()
+                    .strip()
+                )
+            except Exception:
+                pass
+
+            # Assignee
+            try:
+                result["assignee"] = (
+                    page.locator(
+                        "[data-testid='issue.views.field.user.assignee'] span[aria-label], "
+                        "[data-testid='assignee-field'] span"
+                    )
+                    .first.inner_text()
+                    .strip()
+                )
+            except Exception:
+                pass
+
+            # Description — grab all visible text from the description panel
+            try:
+                desc_el = page.locator(
+                    "[data-testid='issue.views.field.rich-text.description'], "
+                    "[data-component-selector='jira-issue-view-common-views-description-field']"
+                ).first
+                if desc_el.count() > 0:
+                    result["description"] = desc_el.inner_text().strip()[:1000]
+            except Exception:
+                pass
+
+            # Full page text for keyword matching
+            try:
+                result["raw_text"] = page.locator("body").inner_text()[:3000]
+            except Exception:
+                pass
+
+            ctx.close()
+    except Exception as exc:
+        logger.debug(f"teams-jira: scrape failed for {jira_url}: {exc}")
+
+    return result
+
+
+async def _scrape_jira_ticket(jira_url: str) -> dict:
+    """Async wrapper around :func:`_scrape_jira_ticket_sync`."""
+    import asyncio
+
+    return await asyncio.to_thread(_scrape_jira_ticket_sync, jira_url)
+
+
+def _load_jira_auto_approve_keywords() -> list:
+    """Return the list of keywords that trigger auto-approval from settings.
+
+    Settings key: ``jira_auto_approve_keywords`` — comma-separated string.
+    Default: empty list (all tickets require manual approval).
+    """
+    try:
+        from routes.email_helpers import _load_settings as _ls
+
+        settings = _ls()
+        raw = settings.get("jira_auto_approve_keywords") or ""
+        return [k.strip().lower() for k in raw.split(",") if k.strip()]
+    except Exception:
+        return []
+
+
+def _ticket_matches_keywords(ticket: dict, keywords: list) -> bool:
+    """Return True if any keyword appears in the ticket's title, description, or status."""
+    if not keywords:
+        return False
+    haystack = " ".join(
+        [
+            ticket.get("title", ""),
+            ticket.get("description", ""),
+            ticket.get("status", ""),
+            ticket.get("raw_text", ""),
+        ]
+    ).lower()
+    return any(kw in haystack for kw in keywords)
+
+
+def _ticket_summary(ticket: dict, issue_key: str, sender_name: str) -> str:
+    """Build a human-readable summary of a Jira ticket for the pending-approval UI."""
+    lines = [f"**{issue_key}** — {ticket.get('title') or 'No title'}"]
+    if ticket.get("status"):
+        lines.append(f"Status: {ticket['status']}")
+    if ticket.get("assignee"):
+        lines.append(f"Assignee: {ticket['assignee']}")
+    if ticket.get("description"):
+        desc = ticket["description"][:300]
+        lines.append(
+            f"Description: {desc}{'…' if len(ticket['description']) > 300 else ''}"
+        )
+    lines.append(f"Requested by: {sender_name}")
+    return "\n".join(lines)
+
+
+# Persistent Odysseus browser profile — survives across runs so login is only needed once.
+_ODYSSEUS_BROWSER_PROFILE = os.path.join(
+    os.path.expanduser("~"), ".odysseus", "browser_profile"
+)
+
+
+def _is_login_page(page) -> bool:
+    """Return True if the current page looks like an Atlassian / generic login page."""
+    title = (page.title() or "").lower()
+    url = (page.url or "").lower()
+    login_signals = ["log in", "login", "sign in", "signin", "atlassian account"]
+    return any(s in title or s in url for s in login_signals)
+
+
+def _jira_approve_via_browser_sync(
+    jira_url: str, comment_text: str = "Approved"
+) -> str:
+    """Open *jira_url* in Playwright using a **persistent Odysseus browser profile**
+    stored at ``~/.odysseus/browser_profile``.
+
+    On the very first run (or after the session expires) the browser opens
+    **headed** so the user can log in once.  The session is then saved in the
+    profile and all future runs work headless automatically.
+    """
+    import os
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return "playwright_not_installed"
+
+    profile_dir = _ODYSSEUS_BROWSER_PROFILE
+    os.makedirs(profile_dir, exist_ok=True)
+
+    def _launch(headless: bool):
+        pw = sync_playwright().start()
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir=profile_dir,
+            headless=headless,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        page = ctx.new_page()
+        page.goto(jira_url, wait_until="domcontentloaded", timeout=30_000)
+        page.wait_for_timeout(3_000)
+        return page, ctx, pw
+
+    try:
+        # Try headless first; if we land on a login page, relaunch headed
+        page, ctx, pw = _launch(headless=True)
+
+        if _is_login_page(page):
+            ctx.close()
+            pw.stop()
+            logger.info(
+                "teams-jira: Jira session not found in Odysseus browser profile — "
+                "opening headed browser so you can log in once. "
+                "The session will be saved for all future runs."
+            )
+            page, ctx, pw = _launch(headless=False)
+            # Wait up to 2 minutes for the user to complete login
+            for _ in range(24):
+                page.wait_for_timeout(5_000)
+                if not _is_login_page(page):
+                    break
+            else:
+                ctx.close()
+                pw.stop()
+                return "login_timeout"
+
+        commented = False
+
+        # Scroll to bottom so the comment section is in view
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(1_000)
+
+        # ── Step 1: JS-click the "Add a comment…" placeholder ────────────────
+        # The placeholder is covered by a "Quick comments" overlay so a normal
+        # click is intercepted. Using element.click() via JS bypasses the overlay.
+        trigger = page.locator(
+            "[data-testid='canned-comments.common.ui.comment-text-area-placeholder.textarea']"
+        ).first
+        if trigger.count() > 0:
+            trigger.evaluate("el => el.click()")
+            page.wait_for_timeout(2_000)
+
+        # ── Step 2: type into the ProseMirror editor ──────────────────────────
+        editor = page.locator(".ProseMirror[role='textbox']").first
+        if editor.count() > 0:
+            editor.click()
+            editor.type(comment_text)
+            page.wait_for_timeout(500)
+
+            # ── Step 3: click the Save button ────────────────────────────────
+            save_btn = page.locator("[data-testid='comment-save-button']").first
+            if save_btn.count() > 0:
+                save_btn.click()
+                page.wait_for_timeout(2_000)
+                commented = True
+
+        ctx.close()
+        pw.stop()
+        return "ok" if commented else "no_comment_box"
+
+    except Exception as exc:
+        return f"browser_exception:{exc}"
+
+
+async def _jira_post_approved(jira_url: str, comment_text: str = "Approved") -> str:
+    """Async wrapper around :func:`_jira_approve_via_browser_sync`."""
+    import asyncio
+
+    return await asyncio.to_thread(
+        _jira_approve_via_browser_sync, jira_url, comment_text
+    )
+
+
+def _strip_html_teams(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text or "").strip()
+
+
+async def _fetch_teams_chat_messages_with_jira(my_id: str, days_back: int = 3) -> list:
+    """Return UNREAD 1:1 and group chat messages that contain a Jira URL.
+
+    Each returned dict has:
+      chat_id, message_id, sender_name, sender_id, body, jira_keys, jira_urls, created_at
+
+    Unread detection: the chat's ``viewpoint.lastMessageReadDateTime`` tells us
+    when the user last read that chat. Any message with createdDateTime after
+    that timestamp (and not sent by us) is considered unread.
+
+    Falls back to a ``days_back`` window when viewpoint is unavailable.
+    """
+    import asyncio
+    from datetime import timedelta
+
+    fallback_since = datetime.utcnow() - timedelta(days=max(1, days_back))
+
+    try:
+        chats_data = await asyncio.to_thread(
+            _graph_get,
+            "https://graph.microsoft.com/v1.0/me/chats"
+            "?$top=50&$select=id,topic,chatType,viewpoint",
+        )
+    except Exception as exc:
+        logger.warning(f"teams-jira: failed to list chats: {exc}")
+        return []
+
+    chats = chats_data.get("value", [])
+    logger.info(f"teams-jira: found {len(chats)} chats to scan")
+
+    results = []
+    for chat in chats:
+        chat_id = chat["id"]
+
+        # Determine the "last read" cutoff for this chat using viewpoint
+        viewpoint = chat.get("viewpoint") or {}
+        last_read_raw = viewpoint.get("lastMessageReadDateTime") or ""
+        if last_read_raw:
+            try:
+                last_read_dt = datetime.strptime(
+                    last_read_raw[:19], "%Y-%m-%dT%H:%M:%S"
+                )
+            except Exception:
+                last_read_dt = fallback_since
+        else:
+            # No viewpoint data — fall back to days_back window
+            last_read_dt = fallback_since
+
+        try:
+            msgs_data = await asyncio.to_thread(
+                _graph_get,
+                (
+                    f"https://graph.microsoft.com/v1.0/me/chats/{chat_id}/messages"
+                    f"?$top=50&$orderby=lastModifiedDateTime desc"
+                ),
+            )
+        except Exception as exc:
+            logger.debug(
+                f"teams-jira: failed to fetch messages for chat {chat_id}: {exc}"
+            )
+            continue
+
+        msgs = msgs_data.get("value", [])
+        for msg in msgs:
+            # Skip system/event messages
+            if msg.get("messageType") != "message":
+                continue
+
+            created_raw = msg.get("createdDateTime", "")
+            if not created_raw:
+                continue
+
+            try:
+                created_dt = datetime.strptime(created_raw[:19], "%Y-%m-%dT%H:%M:%S")
+            except Exception:
+                continue
+
+            # Only process messages newer than the last-read timestamp (i.e. unread)
+            if created_dt <= last_read_dt:
+                continue
+
+            # Skip messages sent by ourselves
+            sender_info = (msg.get("from") or {}).get("user") or {}
+            if sender_info.get("id") == my_id:
+                continue
+
+            body_obj = msg.get("body") or {}
+            raw = body_obj.get("content", "")
+            if body_obj.get("contentType") == "html":
+                raw = _strip_html_teams(raw)
+
+            jira_links = _extract_jira_links(raw)
+            if not jira_links:
+                continue
+
+            logger.info(
+                f"teams-jira: unread Jira link(s) {[k for _, k in jira_links]} "
+                f"in chat {chat_id} from {sender_info.get('displayName', 'Unknown')} "
+                f"(sent {created_raw}, last read {last_read_raw or 'never'})"
+            )
+            results.append(
+                {
+                    "source": "chat",
+                    "chat_id": chat_id,
+                    "team_id": None,
+                    "channel_id": None,
+                    "message_id": msg.get("id", ""),
+                    "sender_name": sender_info.get("displayName") or "Unknown",
+                    "sender_id": sender_info.get("id") or "",
+                    "body": raw[:500],
+                    "jira_keys": [key for _, key in jira_links],
+                    "jira_urls": [url for url, _ in jira_links],
+                    "created_at": created_raw,
+                }
+            )
+
+    logger.info(f"teams-jira: total unread messages with Jira links: {len(results)}")
+    return results
+
+
+async def _fetch_teams_channel_messages_with_jira(
+    my_id: str, days_back: int = 3
+) -> list:
+    """Return recent channel messages (from Teams you're in) that contain a Jira URL
+    and where you are @mentioned.
+
+    Each returned dict has the same shape as :func:`_fetch_teams_chat_messages_with_jira`.
+    """
+    import asyncio
+    from datetime import timedelta
+
+    since_dt = (datetime.utcnow() - timedelta(days=max(1, days_back))).strftime(
+        "%Y-%m-%dT00:00:00Z"
+    )
+
+    try:
+        teams_data = await asyncio.to_thread(
+            _graph_get,
+            "https://graph.microsoft.com/v1.0/me/joinedTeams?$select=id,displayName",
+        )
+    except Exception as exc:
+        logger.warning(f"teams-jira: failed to list joined teams: {exc}")
+        return []
+
+    results = []
+    for team in teams_data.get("value", []):
+        team_id = team["id"]
+        try:
+            channels_data = await asyncio.to_thread(
+                _graph_get,
+                f"https://graph.microsoft.com/v1.0/teams/{team_id}/channels?$select=id,displayName",
+            )
+        except Exception:
+            continue
+
+        for channel in channels_data.get("value", []):
+            channel_id = channel["id"]
+            try:
+                msgs_data = await asyncio.to_thread(
+                    _graph_get,
+                    (
+                        f"https://graph.microsoft.com/v1.0/teams/{team_id}"
+                        f"/channels/{channel_id}/messages"
+                        f"?$top=10&$orderby=createdDateTime desc"
+                    ),
+                )
+            except Exception:
+                continue
+
+            for msg in msgs_data.get("value", []):
+                sender_info = (msg.get("from") or {}).get("user") or {}
+                if sender_info.get("id") == my_id:
+                    continue
+
+                # Only process if we are @mentioned
+                mentions = msg.get("mentions") or []
+                mentioned_ids = [
+                    (m.get("mentioned") or {}).get("user", {}).get("id")
+                    for m in mentions
+                ]
+                if my_id not in mentioned_ids:
+                    continue
+
+                body_obj = msg.get("body") or {}
+                raw = body_obj.get("content", "")
+                if body_obj.get("contentType") == "html":
+                    raw = _strip_html_teams(raw)
+
+                jira_links = _extract_jira_links(raw)
+                if not jira_links:
+                    continue
+
+                results.append(
+                    {
+                        "source": "channel",
+                        "chat_id": None,
+                        "team_id": team_id,
+                        "channel_id": channel_id,
+                        "message_id": msg.get("id", ""),
+                        "sender_name": sender_info.get("displayName") or "Unknown",
+                        "sender_id": sender_info.get("id") or "",
+                        "body": raw[:500],
+                        "jira_keys": [key for _, key in jira_links],
+                        "jira_urls": [url for url, _ in jira_links],
+                        "created_at": msg.get("createdDateTime", ""),
+                    }
+                )
+
+    return results
+
+
+async def _reply_to_teams_message(msg: dict, reply_text: str) -> None:
+    """Post *reply_text* back to the Teams chat or channel thread."""
+    import asyncio
+
+    body_payload = {"body": {"contentType": "text", "content": reply_text}}
+    if msg["source"] == "chat":
+        await asyncio.to_thread(
+            _graph_post,
+            f"https://graph.microsoft.com/v1.0/me/chats/{msg['chat_id']}/messages",
+            body_payload,
+        )
+    else:
+        await asyncio.to_thread(
+            _graph_post,
+            (
+                f"https://graph.microsoft.com/v1.0"
+                f"/teams/{msg['team_id']}/channels/{msg['channel_id']}"
+                f"/messages/{msg['message_id']}/replies"
+            ),
+            body_payload,
+        )
+
+
+async def _teams_jira_approval_pass(owner: str, progress_cb=None) -> str:
+    """Scan Teams chats for unread Jira links.
+
+    For each ticket:
+    - Scrape the Jira page to extract title, status, description.
+    - If the ticket content matches any configured auto-approve keyword
+      (``jira_auto_approve_keywords`` in Settings), approve immediately.
+    - Otherwise, queue it in ``teams_jira_pending`` for the user to review
+      via the /api/teams-jira/pending endpoint.
+
+    De-duplicates via ``teams_jira_approved`` + ``teams_jira_pending`` so
+    each (message_id, issue_key) pair is only acted on once.
+    """
+    import asyncio
+    import sqlite3 as _sql3
+    import uuid
+
+    from routes.msgraph_helpers import _get_access_token
+
+    token = _get_access_token()
+    if not token:
+        return "MSGraph token invalid or not connected — connect via Settings → Microsoft Account"
+
+    approval_comment = _load_jira_approval_comment()
+    auto_keywords = _load_jira_auto_approve_keywords()
+
+    await _emit_progress(progress_cb, "Fetching my Teams user ID…")
+    try:
+        me = await asyncio.to_thread(
+            _graph_get,
+            "https://graph.microsoft.com/v1.0/me?$select=id,displayName",
+        )
+        my_id = me["id"]
+    except Exception as exc:
+        return f"Failed to resolve Teams user: {exc}"
+
+    await _emit_progress(progress_cb, "Scanning Teams chats for Jira links…")
+    all_msgs = await _fetch_teams_chat_messages_with_jira(my_id, days_back=3)
+
+    if not all_msgs:
+        msg_none = "No unread Teams messages with Jira links found"
+        await _emit_progress(progress_cb, msg_none)
+        return msg_none
+
+    # Load already-approved and already-pending sets from DB
+    _c = _sql3.connect(SCHEDULED_DB)
+    try:
+        approved_rows = _c.execute(
+            "SELECT teams_message_id, jira_issue_key FROM teams_jira_approved WHERE owner = ?",
+            (owner or "",),
+        ).fetchall()
+        pending_rows = _c.execute(
+            "SELECT teams_message_id, jira_issue_key FROM teams_jira_pending WHERE owner = ?",
+            (owner or "",),
+        ).fetchall()
+    except Exception:
+        approved_rows = []
+        pending_rows = []
+    finally:
+        _c.close()
+
+    already_done = {(r[0], r[1]) for r in approved_rows} | {
+        (r[0], r[1]) for r in pending_rows
+    }
+
+    examined = len(all_msgs)
+    approved_count = 0
+    queued_count = 0
+    skipped_count = 0
+
+    for msg in all_msgs:
+        message_id = msg["message_id"]
+        jira_keys = msg.get("jira_keys", [])
+        jira_urls = msg.get("jira_urls", [])
+
+        for issue_key, jira_url in zip(jira_keys, jira_urls):
+            if (message_id, issue_key) in already_done:
+                skipped_count += 1
+                continue
+
+            await _emit_progress(
+                progress_cb,
+                f"Checking {issue_key} (from {msg['sender_name']})…",
+            )
+
+            # Scrape ticket content
+            ticket = await _scrape_jira_ticket(jira_url)
+
+            if _ticket_matches_keywords(ticket, auto_keywords):
+                # ── Auto-approve path ─────────────────────────────────────────
+                await _emit_progress(
+                    progress_cb,
+                    f"Auto-approving {issue_key} (keyword match)…",
+                )
+                jira_status = await _jira_post_approved(jira_url, approval_comment)
+                if jira_status != "ok":
+                    logger.warning(
+                        f"teams-jira: browser approval failed for {issue_key}: {jira_status}"
+                    )
+                    continue
+
+                reply_text = (
+                    f"Approved ✅ — I've posted an approval comment on {issue_key}."
+                )
+                try:
+                    await _reply_to_teams_message(msg, reply_text)
+                except Exception as exc:
+                    logger.warning(
+                        f"teams-jira: Teams reply failed for {message_id}: {exc}"
+                    )
+
+                _c = _sql3.connect(SCHEDULED_DB)
+                try:
+                    _c.execute(
+                        "INSERT OR IGNORE INTO teams_jira_approved "
+                        "(teams_message_id, jira_issue_key, owner, approved_at) VALUES (?, ?, ?, ?)",
+                        (
+                            message_id,
+                            issue_key,
+                            owner or "",
+                            datetime.utcnow().isoformat(),
+                        ),
+                    )
+                    _c.commit()
+                except Exception:
+                    pass
+                finally:
+                    _c.close()
+
+                already_done.add((message_id, issue_key))
+                approved_count += 1
+
+            else:
+                # ── Queue for manual review ───────────────────────────────────
+                summary_text = _ticket_summary(ticket, issue_key, msg["sender_name"])
+                pending_id = str(uuid.uuid4())
+                _c = _sql3.connect(SCHEDULED_DB)
+                try:
+                    _c.execute(
+                        "INSERT OR IGNORE INTO teams_jira_pending "
+                        "(id, owner, teams_message_id, chat_id, team_id, channel_id, source, "
+                        " sender_name, jira_issue_key, jira_url, ticket_summary, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            pending_id,
+                            owner or "",
+                            message_id,
+                            msg.get("chat_id") or "",
+                            msg.get("team_id") or "",
+                            msg.get("channel_id") or "",
+                            msg.get("source", "chat"),
+                            msg.get("sender_name", ""),
+                            issue_key,
+                            jira_url,
+                            summary_text,
+                            datetime.utcnow().isoformat(),
+                        ),
+                    )
+                    _c.commit()
+                except Exception:
+                    pass
+                finally:
+                    _c.close()
+
+                already_done.add((message_id, issue_key))
+                queued_count += 1
+                logger.info(
+                    f"teams-jira: queued {issue_key} for manual review "
+                    f"(from {msg['sender_name']})"
+                )
+
+    summary = (
+        f"Examined {examined} Teams message(s) with Jira links; "
+        f"auto-approved {approved_count}; queued {queued_count} for review; "
+        f"skipped {skipped_count} already-done"
+    )
+    await _emit_progress(progress_cb, summary)
+    return summary
 
 
 def _latest_inbox_fallback_uids(conn, reconnect):

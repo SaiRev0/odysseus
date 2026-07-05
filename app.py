@@ -213,7 +213,10 @@ class _RequestTimeoutMiddleware(_BaseHTTPMiddleware):
 
 class _InteractiveActivityMiddleware(_BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        from src.interactive_gate import should_track_interactive_request, track_interactive_request
+        from src.interactive_gate import (
+            should_track_interactive_request,
+            track_interactive_request,
+        )
 
         path = request.url.path or ""
         if not should_track_interactive_request(path, request.method):
@@ -716,6 +719,7 @@ app.include_router(auth_router)
 @app.post("/api/activity/heartbeat")
 async def activity_heartbeat():
     from src.interactive_gate import mark_browser_activity
+
     await mark_browser_activity()
     async def _stop_background():
         try:
@@ -760,7 +764,10 @@ app.include_router(setup_admin_wipe_routes(session_manager))
 
 # Memory
 from routes.memory.memory_routes import setup_memory_routes
-memory_router = setup_memory_routes(memory_manager, session_manager, memory_vector=memory_vector)
+
+memory_router = setup_memory_routes(
+    memory_manager, session_manager, memory_vector=memory_vector
+)
 app.include_router(memory_router)
 from routes.skills_routes import setup_skills_routes
 
@@ -785,7 +792,10 @@ app.include_router(
 
 # Research (background deep-research tasks)
 from routes.research.research_routes import setup_research_routes
-app.include_router(setup_research_routes(research_handler, session_manager=session_manager))
+
+app.include_router(
+    setup_research_routes(research_handler, session_manager=session_manager)
+)
 
 # History
 from routes.history.history_routes import setup_history_routes
@@ -867,6 +877,7 @@ app.include_router(setup_signature_routes())
 
 # Gallery (image library)
 from routes.gallery.gallery_routes import setup_gallery_routes
+
 app.include_router(setup_gallery_routes())
 
 # Persisted image-editor drafts (server-backed projects)
@@ -987,6 +998,11 @@ app.include_router(email_router)
 from routes.msgraph_routes import setup_msgraph_routes
 
 app.include_router(setup_msgraph_routes())
+
+# Teams-Jira pending approval queue
+from routes.teams_jira_routes import setup_teams_jira_routes
+
+setup_teams_jira_routes(app)
 
 # Codex integration — HTTP surface for the Codex plugin/MCP bridge. Reuses
 # api_token scopes (todos:read|write, email:read|draft|send) so external
@@ -1293,8 +1309,14 @@ async def _startup_event():
     # Keep-alive is opt-in. The ping path performs model discovery, and when
     # stale LAN endpoints are configured it can add periodic backend pressure
     # that delays unrelated UI requests such as Notes/Documents.
-    _keepalive_enabled = str(os.getenv("ODYSSEUS_MODEL_KEEPALIVE", "")).lower() in {"1", "true", "yes", "on"}
+    _keepalive_enabled = str(os.getenv("ODYSSEUS_MODEL_KEEPALIVE", "")).lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     if _keepalive_enabled:
+
         async def _keepalive_loop():
             while True:
                 try:

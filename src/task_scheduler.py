@@ -345,6 +345,14 @@ HOUSEKEEPING_DEFAULTS = {
         "ship_paused": True,
         "legacy_names": [],
     },
+    "teams_jira_approval": {
+        "name": "Teams Jira Auto-Approve",
+        "schedule": "cron",
+        "scheduled_time": None,
+        "cron_expression": "*/15 * * * *",
+        "ship_paused": True,
+        "legacy_names": [],
+    },
     "classify_events": {
         "name": "Calendar Classify Events",
         "schedule": "cron",

@@ -423,6 +423,7 @@ const _TASK_ICONS = {
   summarize_emails:    '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/>',
   draft_email_replies: '<polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/>',
   conditional_auto_reply: '<path d="M20 6 9 17l-5-5"/><rect x="2" y="4" width="20" height="16" rx="2"/>',
+  teams_jira_approval: '<path d="M20 6 9 17l-5-5"/><path d="M15 3h6v6"/><path d="M10 14H3v7h7v-7z"/>',
   email_auto_translate:'<path d="M5 8h9"/><path d="M9 4v4"/><path d="M4 13c2.2-.2 4.2-1.1 5.5-2.8"/><path d="M10.5 13c-1.1-.6-2-1.5-2.7-2.8"/><path d="M14 20l4-9 4 9"/><path d="M15.4 17h5.2"/>',
   extract_email_events:'<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M7 14h5"/><path d="M7 18h8"/>',
   classify_events:    '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/><path d="M8 15h.01M12 15h.01M16 15h.01"/>',
@@ -598,6 +599,7 @@ const _CATEGORY_MAP = {
   summarize_emails:           'Email',
   draft_email_replies:        'Email',
   conditional_auto_reply:     'Email',
+  teams_jira_approval:        'Teams',
   email_auto_translate:       'Email',
   learn_sender_signatures:    'Email',
   check_email_urgency:        'Email',
@@ -913,6 +915,9 @@ function _renderList() {
     }
     if (task.action === 'conditional_auto_reply') {
       _renderAutoReplyRuleBuilder(detail);
+    }
+    if (task.action === 'teams_jira_approval') {
+      _renderTeamsJiraConfig(detail);
     }
     
     detail.appendChild(detailActions);
@@ -3218,6 +3223,189 @@ function _showRuleForm(container, rule, onDone) {
   };
 }
 
+
+// ── Teams Jira Config UI ──────────────────────────────────────────────────────
+
+async function _fetchTeamsJiraPending() {
+  try {
+    const res = await fetch(`${API_BASE}/api/teams-jira/pending`);
+    if (res.ok) return (await res.json()).pending || [];
+  } catch (e) { console.error('teams-jira: fetch pending failed', e); }
+  return [];
+}
+
+async function _approveTeamsJiraPending(id) {
+  const res = await fetch(`${API_BASE}/api/teams-jira/pending/${id}/approve`, { method: 'POST' });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+async function _dismissTeamsJiraPending(id) {
+  const res = await fetch(`${API_BASE}/api/teams-jira/pending/${id}`, { method: 'DELETE' });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+async function _saveTeamsJiraKeywords(keywords) {
+  // Save via the settings API — same key the backend reads
+  const res = await fetch(`${API_BASE}/api/auth/settings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jira_auto_approve_keywords: keywords }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+
+async function _loadTeamsJiraKeywords() {
+  try {
+    const res = await fetch(`${API_BASE}/api/auth/settings`);
+    if (res.ok) {
+      const d = await res.json();
+      return d.jira_auto_approve_keywords || '';
+    }
+  } catch (e) { /* ignore */ }
+  return '';
+}
+
+function _renderTeamsJiraConfig(container) {
+  const box = document.createElement('div');
+  box.style.cssText = 'margin-top:12px; border-top:1px solid var(--border); padding-top:12px;';
+  container.appendChild(box);
+
+  const render = async () => {
+    box.innerHTML = '';
+
+    // ── Keywords section ──────────────────────────────────────────────────
+    const kwHdr = document.createElement('div');
+    kwHdr.style.cssText = 'font-weight:600; margin-bottom:8px;';
+    kwHdr.textContent = 'Auto-Approve Keywords';
+    box.appendChild(kwHdr);
+
+    const kwDesc = document.createElement('div');
+    kwDesc.style.cssText = 'font-size:11px; opacity:0.7; margin-bottom:8px;';
+    kwDesc.textContent = 'If any keyword appears in the Jira ticket, it is approved automatically. Leave empty to always ask for review.';
+    box.appendChild(kwDesc);
+
+    const kwRow = document.createElement('div');
+    kwRow.style.cssText = 'display:flex; gap:8px; align-items:center; margin-bottom:16px;';
+
+    const kwInput = document.createElement('input');
+    kwInput.type = 'text';
+    kwInput.className = 'task-form-input';
+    kwInput.style.cssText = 'flex:1; font-size:12px;';
+    kwInput.placeholder = 'e.g. access request, mongo, prod cluster';
+    kwInput.value = await _loadTeamsJiraKeywords();
+    kwRow.appendChild(kwInput);
+
+    const kwSave = document.createElement('button');
+    kwSave.className = 'btn';
+    kwSave.style.cssText = 'padding:4px 10px; font-size:11px; white-space:nowrap;';
+    kwSave.textContent = 'Save';
+    kwSave.onclick = async (e) => {
+      e.stopPropagation();
+      kwSave.disabled = true;
+      kwSave.textContent = 'Saving…';
+      try {
+        await _saveTeamsJiraKeywords(kwInput.value.trim());
+        kwSave.textContent = 'Saved ✓';
+        setTimeout(() => { kwSave.textContent = 'Save'; kwSave.disabled = false; }, 1500);
+      } catch (err) {
+        kwSave.textContent = 'Error';
+        kwSave.disabled = false;
+      }
+    };
+    kwRow.appendChild(kwSave);
+    box.appendChild(kwRow);
+
+    // ── Pending approvals section ─────────────────────────────────────────
+    const pendHdr = document.createElement('div');
+    pendHdr.style.cssText = 'font-weight:600; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;';
+    pendHdr.innerHTML = '<span>Pending Approvals</span>';
+
+    const refreshBtn = document.createElement('button');
+    refreshBtn.className = 'memory-toolbar-btn';
+    refreshBtn.style.cssText = 'font-size:11px;';
+    refreshBtn.textContent = '↻ Refresh';
+    refreshBtn.onclick = (e) => { e.stopPropagation(); render(); };
+    pendHdr.appendChild(refreshBtn);
+    box.appendChild(pendHdr);
+
+    const pending = await _fetchTeamsJiraPending();
+
+    if (pending.length === 0) {
+      const empty = document.createElement('div');
+      empty.style.cssText = 'opacity:0.6; font-size:12px; padding:12px 0; text-align:center;';
+      empty.textContent = 'No tickets awaiting approval.';
+      box.appendChild(empty);
+      return;
+    }
+
+    for (const item of pending) {
+      const card = document.createElement('div');
+      card.style.cssText = 'margin-bottom:10px; padding:10px; border:1px solid var(--border); border-radius:6px; background:var(--bg-card);';
+
+      // Header row: issue key + sender
+      const cardTop = document.createElement('div');
+      cardTop.style.cssText = 'display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:6px;';
+
+      const keyEl = document.createElement('div');
+      keyEl.style.cssText = 'font-weight:600; font-size:13px;';
+      keyEl.innerHTML = `<a href="${_esc(item.jira_url)}" target="_blank" style="color:var(--accent); text-decoration:none;">${_esc(item.jira_issue_key)}</a>`;
+      cardTop.appendChild(keyEl);
+
+      const senderEl = document.createElement('div');
+      senderEl.style.cssText = 'font-size:11px; opacity:0.7;';
+      senderEl.textContent = `From: ${item.sender_name}`;
+      cardTop.appendChild(senderEl);
+      card.appendChild(cardTop);
+
+      // Summary
+      if (item.ticket_summary) {
+        const sumEl = document.createElement('pre');
+        sumEl.style.cssText = 'font-size:11px; white-space:pre-wrap; opacity:0.85; margin:0 0 8px 0; font-family:inherit; line-height:1.5;';
+        sumEl.textContent = item.ticket_summary;
+        card.appendChild(sumEl);
+      }
+
+      // Action buttons
+      const btnRow = document.createElement('div');
+      btnRow.style.cssText = 'display:flex; gap:8px; justify-content:flex-end;';
+
+      const dismissBtn = document.createElement('button');
+      dismissBtn.className = 'btn btn-secondary';
+      dismissBtn.style.cssText = 'padding:4px 10px; font-size:11px;';
+      dismissBtn.textContent = 'Dismiss';
+      dismissBtn.onclick = async (e) => {
+        e.stopPropagation();
+        dismissBtn.disabled = true;
+        dismissBtn.textContent = 'Dismissing…';
+        try { await _dismissTeamsJiraPending(item.id); render(); }
+        catch (err) { dismissBtn.textContent = 'Error'; dismissBtn.disabled = false; }
+      };
+      btnRow.appendChild(dismissBtn);
+
+      const approveBtn = document.createElement('button');
+      approveBtn.className = 'btn';
+      approveBtn.style.cssText = 'padding:4px 10px; font-size:11px;';
+      approveBtn.textContent = 'Approve ✅';
+      approveBtn.onclick = async (e) => {
+        e.stopPropagation();
+        approveBtn.disabled = true;
+        approveBtn.textContent = 'Approving…';
+        try { await _approveTeamsJiraPending(item.id); render(); }
+        catch (err) {
+          approveBtn.textContent = 'Error';
+          approveBtn.disabled = false;
+          console.error('teams-jira approve failed', err);
+        }
+      };
+      btnRow.appendChild(approveBtn);
+      card.appendChild(btnRow);
+
+      box.appendChild(card);
+    }
+  };
+
+  render();
+}
 
 function startNotificationPolling() {
   if (_notifInterval) return;
