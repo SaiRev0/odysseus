@@ -43,8 +43,22 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Inject the native system trust store (macOS Keychain, Windows Certificate
+# Store, Linux NSS) into Python's ssl module so that corporate / enterprise
+# proxy CAs that are trusted at the OS level are also trusted by httpx.
+# This is a no-op on systems where truststore is not installed.
+try:
+    import truststore
 
-_extra_bundle_path: Optional[str] = (os.environ.get("LLM_CA_BUNDLE") or "").strip() or None
+    truststore.inject_into_ssl()
+    logger.debug("truststore: native system trust store injected into ssl module.")
+except ImportError:
+    pass
+
+
+_extra_bundle_path: Optional[str] = (
+    os.environ.get("LLM_CA_BUNDLE") or ""
+).strip() or None
 
 
 def _build_ssl_context() -> Optional[ssl.SSLContext]:
