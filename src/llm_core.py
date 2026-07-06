@@ -2968,7 +2968,11 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                                                 return
                                             yield _stream_delta_event(reasoning, thinking=True)
                                         if content:
-                                            content = _strip_visible_chat_template_artifacts(content)
+                                            content = (
+                                                _strip_visible_chat_template_artifacts(
+                                                    content
+                                                )
+                                            )
                                             if not content:
                                                 continue
                                             _degenerate = degenerate_guard.check(content)
@@ -3013,9 +3017,15 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                                                             # Strip the opening <think[...] > from the first chunk.
                                                             # Use a dedicated flag — _first_content_sent stays False
                                                             # throughout the think block, so it must not be reused.
-                                                            tag_end = think_part.lower().find(">")
+                                                            tag_end = (
+                                                                think_part.lower().find(
+                                                                    ">"
+                                                                )
+                                                            )
                                                             if tag_end != -1:
-                                                                think_part = think_part[tag_end + 1:]
+                                                                think_part = think_part[
+                                                                    tag_end + 1 :
+                                                                ]
                                                             _think_open_stripped = True
                                                             regular_part = content[
                                                                 close_idx
@@ -3062,76 +3072,74 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                                                             )
                                                         _first_content_sent = True
                                                         yield f"data: {json.dumps({'delta': content})}\n\n"
-                                            # Native tool calls — accumulate across chunks
-                                            for tc in delta.get("tool_calls") or []:
-                                                if tc is None:
-                                                    continue
-                                                func = tc.get("function") or {}
-                                                raw_idx = tc.get("index")
-                                                if raw_idx is None:
-                                                    # Gemini's OpenAI-compat layer omits `index` on
-                                                    # parallel tool calls (every delta arrives as
-                                                    # index=None) and sends each call complete in one
-                                                    # delta. Without this, all parallel calls collide
-                                                    # into slot 0 — later calls overwrite the first's
-                                                    # name and CORRUPT its arguments by concatenation,
-                                                    # so only one malformed call survives and the
-                                                    # follow-up round 400s. A function name marks the
-                                                    # start of a new call → allocate a fresh slot;
-                                                    # an arg-only continuation attaches to the last.
-                                                    if (
-                                                        func.get("name")
-                                                        or _tc_last_idx[0] < 0
-                                                    ):
-                                                        # Next free slot ABOVE any existing key (not
-                                                        # len()), so a provider mixing integer indices
-                                                        # with index=None can never collide.
-                                                        idx = (
-                                                            max(_tc_acc, default=-1) + 1
-                                                        )
-                                                    else:
-                                                        idx = _tc_last_idx[0]
+                                        # Native tool calls — accumulate across chunks
+                                        for tc in delta.get("tool_calls") or []:
+                                            if tc is None:
+                                                continue
+                                            func = tc.get("function") or {}
+                                            raw_idx = tc.get("index")
+                                            if raw_idx is None:
+                                                # Gemini's OpenAI-compat layer omits `index` on
+                                                # parallel tool calls (every delta arrives as
+                                                # index=None) and sends each call complete in one
+                                                # delta. Without this, all parallel calls collide
+                                                # into slot 0 — later calls overwrite the first's
+                                                # name and CORRUPT its arguments by concatenation,
+                                                # so only one malformed call survives and the
+                                                # follow-up round 400s. A function name marks the
+                                                # start of a new call → allocate a fresh slot;
+                                                # an arg-only continuation attaches to the last.
+                                                if (
+                                                    func.get("name")
+                                                    or _tc_last_idx[0] < 0
+                                                ):
+                                                    # Next free slot ABOVE any existing key (not
+                                                    # len()), so a provider mixing integer indices
+                                                    # with index=None can never collide.
+                                                    idx = max(_tc_acc, default=-1) + 1
                                                 else:
-                                                    idx = raw_idx
-                                                _tc_last_idx[0] = idx
-                                                if idx not in _tc_acc:
-                                                    _tc_acc[idx] = {
-                                                        "id": "",
-                                                        "name": "",
-                                                        "arguments": "",
-                                                    }
-                                                if tc.get("id"):
-                                                    _tc_acc[idx]["id"] = tc["id"]
-                                                # Gemini 3 returns an opaque thought_signature in
-                                                # extra_content on the function-call delta. It MUST be
-                                                # echoed back on the assistant tool_call next round or the
-                                                # follow-up request 400s ("Function call is missing a
-                                                # thought_signature"). Preserve it verbatim; other
-                                                # providers never send it, so this is a no-op for them.
-                                                if tc.get("extra_content"):
-                                                    _tc_acc[idx]["extra_content"] = tc[
-                                                        "extra_content"
-                                                    ]
-                                                if func.get("name"):
-                                                    _tc_acc[idx]["name"] = func["name"]
-                                                if "arguments" in func:
-                                                    # Guard against a null arguments delta: `func` can be
-                                                    # {"arguments": None} (JSON null), and a raw `+= None`
-                                                    # raises TypeError that the broad except swallows,
-                                                    # silently dropping the rest of the chunk. Matches the
-                                                    # Anthropic accumulator (`partial = ... or ""`) above.
-                                                    _tc_acc[idx]["arguments"] += (
-                                                        func["arguments"] or ""
-                                                    )
-                                                    # Stream tool arg deltas for doc tools
-                                                    if func["arguments"] and _tc_acc[
-                                                        idx
-                                                    ].get("name") in (
-                                                        "create_document",
-                                                        "update_document",
-                                                        "edit_document",
-                                                    ):
-                                                        yield f"data: {json.dumps({'type': 'tool_call_delta', 'index': idx, 'name': _tc_acc[idx]['name'], 'arg_delta': func['arguments']})}\n\n"
+                                                    idx = _tc_last_idx[0]
+                                            else:
+                                                idx = raw_idx
+                                            _tc_last_idx[0] = idx
+                                            if idx not in _tc_acc:
+                                                _tc_acc[idx] = {
+                                                    "id": "",
+                                                    "name": "",
+                                                    "arguments": "",
+                                                }
+                                            if tc.get("id"):
+                                                _tc_acc[idx]["id"] = tc["id"]
+                                            # Gemini 3 returns an opaque thought_signature in
+                                            # extra_content on the function-call delta. It MUST be
+                                            # echoed back on the assistant tool_call next round or the
+                                            # follow-up request 400s ("Function call is missing a
+                                            # thought_signature"). Preserve it verbatim; other
+                                            # providers never send it, so this is a no-op for them.
+                                            if tc.get("extra_content"):
+                                                _tc_acc[idx]["extra_content"] = tc[
+                                                    "extra_content"
+                                                ]
+                                            if func.get("name"):
+                                                _tc_acc[idx]["name"] = func["name"]
+                                            if "arguments" in func:
+                                                # Guard against a null arguments delta: `func` can be
+                                                # {"arguments": None} (JSON null), and a raw `+= None`
+                                                # raises TypeError that the broad except swallows,
+                                                # silently dropping the rest of the chunk. Matches the
+                                                # Anthropic accumulator (`partial = ... or ""`) above.
+                                                _tc_acc[idx]["arguments"] += (
+                                                    func["arguments"] or ""
+                                                )
+                                                # Stream tool arg deltas for doc tools
+                                                if func["arguments"] and _tc_acc[
+                                                    idx
+                                                ].get("name") in (
+                                                    "create_document",
+                                                    "update_document",
+                                                    "edit_document",
+                                                ):
+                                                    yield f"data: {json.dumps({'type': 'tool_call_delta', 'index': idx, 'name': _tc_acc[idx]['name'], 'arg_delta': func['arguments']})}\n\n"
                                     elif "text" in j:
                                         if j["text"]:
                                             for event in _format_routed_content(

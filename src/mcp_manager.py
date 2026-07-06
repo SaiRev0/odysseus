@@ -180,52 +180,76 @@ class McpManager:
 
     async def _connect_stdio(self, server_id: str, name: str, command: str, args: List[str], env: Dict[str, str]) -> bool:
         """Connect to an MCP server via stdio transport."""
-        try:
-            from mcp import ClientSession, StdioServerParameters
-            from mcp.client.stdio import stdio_client
-            from contextlib import AsyncExitStack
+        import asyncio
 
-            server_params = StdioServerParameters(
-                command=command,
-                args=args,
-                env={**os.environ, **env} if env else None,
-            )
+        init_future = asyncio.Future()
+        stop_event = asyncio.Event()
 
-            stack = AsyncExitStack()
+        async def _run():
             try:
-                transport = await stack.enter_async_context(stdio_client(server_params))
-                read_stream, write_stream = transport
-                session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
+                from mcp import ClientSession, StdioServerParameters
+                from mcp.client.stdio import stdio_client
+                from contextlib import AsyncExitStack
 
-                await session.initialize()
+                server_params = StdioServerParameters(
+                    command=command,
+                    args=args,
+                    env={**os.environ, **env} if env else None,
+                )
 
-                # Discover tools
-                tools_result = await session.list_tools()
-            except Exception:
-                await stack.aclose()
-                raise
+                async with AsyncExitStack() as stack:
+                    transport = await stack.enter_async_context(
+                        stdio_client(server_params)
+                    )
+                    read_stream, write_stream = transport
+                    session = await stack.enter_async_context(
+                        ClientSession(read_stream, write_stream)
+                    )
+
+                    await session.initialize()
+                    tools_result = await session.list_tools()
+
+                    # Report success back to caller
+                    init_future.set_result((session, tools_result))
+
+                    # Keep context managers alive until disconnect is requested
+                    await stop_event.wait()
+            except Exception as e:
+                if not init_future.done():
+                    init_future.set_exception(e)
+                else:
+                    logger.debug(f"MCP server {server_id} connection ended: {e}")
+
+        asyncio.create_task(_run())
+
+        try:
+            session, tools_result = await init_future
+
             tools = []
             for tool in tools_result.tools:
-                tools.append({
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "input_schema": tool.inputSchema if hasattr(tool, 'inputSchema') else {},
-                    # MCP tool annotations (readOnlyHint / destructiveHint) drive
-                    # plan-mode read-only gating. Absent on many servers, so we
-                    # fall back to a name heuristic in mcp_tool_is_readonly().
-                    "annotations": getattr(tool, 'annotations', None),
-                })
+                tools.append(
+                    {
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "input_schema": tool.inputSchema
+                        if hasattr(tool, "inputSchema")
+                        else {},
+                        "annotations": getattr(tool, "annotations", None),
+                    }
+                )
 
             self._sessions[server_id] = session
-            self._stacks[server_id] = stack
+            # Store the event instead of the stack so we can signal clean shutdown
+            self._stacks[server_id] = stop_event
             self._tools[server_id] = tools
-            # Extract identity hints from env vars (e.g. email address, API name)
-            # so tool descriptions can distinguish between multiple instances of
-            # the same MCP server (e.g. two email accounts).
+
             identity_hints = []
             for k, v in (env or {}).items():
                 k_lower = k.lower()
-                if any(x in k_lower for x in ['email_address', 'account', 'user', 'username']):
+                if any(
+                    x in k_lower
+                    for x in ["email_address", "account", "user", "username"]
+                ):
                     identity_hints.append(v)
             identity = ", ".join(identity_hints) if identity_hints else ""
 
@@ -247,38 +271,58 @@ class McpManager:
 
     async def _connect_sse(self, server_id: str, name: str, url: str) -> bool:
         """Connect to an MCP server via SSE transport."""
-        try:
-            from mcp import ClientSession
-            from mcp.client.sse import sse_client
-            from contextlib import AsyncExitStack
+        import asyncio
 
-            stack = AsyncExitStack()
+        init_future = asyncio.Future()
+        stop_event = asyncio.Event()
+
+        async def _run():
             try:
-                transport = await stack.enter_async_context(sse_client(url))
-                read_stream, write_stream = transport
-                session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
+                from mcp import ClientSession
+                from mcp.client.sse import sse_client
+                from contextlib import AsyncExitStack
 
-                await session.initialize()
+                async with AsyncExitStack() as stack:
+                    transport = await stack.enter_async_context(sse_client(url))
+                    read_stream, write_stream = transport
+                    session = await stack.enter_async_context(
+                        ClientSession(read_stream, write_stream)
+                    )
 
-                # Discover tools
-                tools_result = await session.list_tools()
-            except Exception:
-                await stack.aclose()
-                raise
+                    await session.initialize()
+                    tools_result = await session.list_tools()
+
+                    # Report success back to caller
+                    init_future.set_result((session, tools_result))
+
+                    # Keep context managers alive until disconnect is requested
+                    await stop_event.wait()
+            except Exception as e:
+                if not init_future.done():
+                    init_future.set_exception(e)
+                else:
+                    logger.debug(f"MCP server {server_id} connection ended: {e}")
+
+        asyncio.create_task(_run())
+
+        try:
+            session, tools_result = await init_future
+
             tools = []
             for tool in tools_result.tools:
-                tools.append({
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "input_schema": tool.inputSchema if hasattr(tool, 'inputSchema') else {},
-                    # MCP tool annotations (readOnlyHint / destructiveHint) drive
-                    # plan-mode read-only gating. Absent on many servers, so we
-                    # fall back to a name heuristic in mcp_tool_is_readonly().
-                    "annotations": getattr(tool, 'annotations', None),
-                })
+                tools.append(
+                    {
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "input_schema": tool.inputSchema
+                        if hasattr(tool, "inputSchema")
+                        else {},
+                        "annotations": getattr(tool, "annotations", None),
+                    }
+                )
 
             self._sessions[server_id] = session
-            self._stacks[server_id] = stack
+            self._stacks[server_id] = stop_event
             self._tools[server_id] = tools
             self._connections[server_id] = {
                 "status": "connected",
@@ -324,47 +368,78 @@ class McpManager:
 
     async def _connect_http(self, server_id: str, name: str, url: str) -> bool:
         """Connect to a Streamable HTTP MCP server (with automatic OAuth)."""
+        import asyncio
+
+        init_future = asyncio.Future()
+        stop_event = asyncio.Event()
+
+        async def _run():
+            try:
+                from mcp import ClientSession
+                from mcp.client.streamable_http import streamablehttp_client
+                from contextlib import AsyncExitStack
+                from src.mcp_oauth import build_provider
+
+                def _on_redirect(auth_url):
+                    # Publish needs_auth the moment the URL is known, independent of
+                    # how long discovery/DCR took (may exceed the bounded start wait).
+                    self._connections[server_id] = {
+                        "status": "needs_auth",
+                        "name": name,
+                        "transport": "http",
+                        "auth_url": auth_url,
+                    }
+
+                provider = build_provider(server_id, url, on_redirect=_on_redirect)
+
+                async with AsyncExitStack() as stack:
+                    transport = await stack.enter_async_context(
+                        streamablehttp_client(url, auth=provider)
+                    )
+                    read_stream, write_stream, _get_session_id = transport
+                    session = await stack.enter_async_context(
+                        ClientSession(read_stream, write_stream)
+                    )
+                    await session.initialize()
+
+                    tools_result = await session.list_tools()
+                    init_future.set_result((session, tools_result))
+
+                    # Keep context managers alive
+                    await stop_event.wait()
+            except Exception as e:
+                if not init_future.done():
+                    init_future.set_exception(e)
+                else:
+                    logger.debug(f"MCP HTTP server {server_id} connection ended: {e}")
+
+        asyncio.create_task(_run())
+
         try:
-            from mcp import ClientSession
-            from mcp.client.streamable_http import streamablehttp_client
-            from contextlib import AsyncExitStack
-            from src.mcp_oauth import build_provider, clear_auth_url
+            session, tools_result = await init_future
 
-            def _on_redirect(auth_url):
-                # Publish needs_auth the moment the URL is known, independent of
-                # how long discovery/DCR took (may exceed the bounded start wait).
-                self._connections[server_id] = {
-                    "status": "needs_auth", "name": name, "transport": "http",
-                    "auth_url": auth_url,
-                }
-
-            provider = build_provider(server_id, url, on_redirect=_on_redirect)
-            stack = AsyncExitStack()
-            transport = await stack.enter_async_context(streamablehttp_client(url, auth=provider))
-            read_stream, write_stream, _get_session_id = transport
-            session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
-            await session.initialize()
-
-            tools_result = await session.list_tools()
             tools = []
             for tool in tools_result.tools:
-                tools.append({
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "input_schema": tool.inputSchema if hasattr(tool, "inputSchema") else {},
-                })
+                tools.append(
+                    {
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "input_schema": tool.inputSchema
+                        if hasattr(tool, "inputSchema")
+                        else {},
+                    }
+                )
 
             self._sessions[server_id] = session
-            self._stacks[server_id] = stack
+            self._stacks[server_id] = stop_event
             self._tools[server_id] = tools
             self._connections[server_id] = {
-                "status": "connected", "name": name, "transport": "http",
+                "status": "connected",
+                "name": name,
+                "transport": "http",
                 "tool_count": len(tools),
             }
-            clear_auth_url(server_id)
-            # Tools changed (this can complete after connect_server already
-            # returned, via the background OAuth flow), so bump the generation
-            # to invalidate the tool-prompt cache.
+
             self._generation += 1
             logger.info(f"MCP server connected: {name} ({server_id}) - {len(tools)} tools via http")
             return True
@@ -390,12 +465,21 @@ class McpManager:
         except Exception:
             pass
 
-        stack = self._stacks.pop(server_id, None)
-        if stack:
-            try:
-                await stack.aclose()
-            except Exception as e:
-                logger.warning(f"Error closing MCP server {server_id}: {e}")
+        stop_event = self._stacks.pop(server_id, None)
+        if stop_event:
+            if hasattr(stop_event, "set"):
+                stop_event.set()
+            elif hasattr(stop_event, "aclose"):
+                # Fallback for old code in case it is still an AsyncExitStack
+                import asyncio as _asyncio
+
+                async def _close_stack(s, sid=server_id):
+                    try:
+                        await s.aclose()
+                    except Exception as _e:
+                        logger.warning(f"Error closing MCP server {sid}: {_e}")
+
+                _asyncio.ensure_future(_close_stack(stop_event))
 
         self._sessions.pop(server_id, None)
         self._tools.pop(server_id, None)
@@ -555,12 +639,23 @@ class McpManager:
                 if tool["name"] in disabled:
                     continue
                 qualified = f"mcp__{server_id}__{tool['name']}"
+                raw_schema = tool.get(
+                    "input_schema", {"type": "object", "properties": {}}
+                )
+                # Strip JSON Schema draft keywords that OpenAI/Gemini reject
+                # ($schema, additionalProperties) — they cause an empty API
+                # response when present in function-calling parameters.
+                params = {
+                    k: v
+                    for k, v in raw_schema.items()
+                    if k not in ("$schema", "additionalProperties")
+                }
                 schema = {
                     "type": "function",
                     "function": {
                         "name": qualified,
                         "description": f"[MCP:{label}] {tool['description']}",
-                        "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
+                        "parameters": params,
                     },
                 }
                 schemas.append(schema)
@@ -574,15 +669,17 @@ class McpManager:
             conn = self._connections.get(server_id, {})
             disabled = (disabled_map or {}).get(server_id, set())
             for tool in tools:
-                result.append({
-                    "server_id": server_id,
-                    "server_name": conn.get("name", server_id),
-                    "name": tool["name"],
-                    "qualified_name": f"mcp__{server_id}__{tool['name']}",
-                    "description": tool.get("description", ""),
-                    "input_schema": tool.get("input_schema") or {},
-                    "is_disabled": tool["name"] in disabled,
-                })
+                result.append(
+                    {
+                        "server_id": server_id,
+                        "server_name": conn.get("name", server_id),
+                        "name": tool["name"],
+                        "qualified_name": f"mcp__{server_id}__{tool['name']}",
+                        "description": tool.get("description", ""),
+                        "input_schema": tool.get("input_schema") or {},
+                        "is_disabled": tool["name"] in disabled,
+                    }
+                )
         return result
 
     def plan_mode_blocked_mcp(self) -> Tuple[Dict[str, Set[str]], Set[str]]:
